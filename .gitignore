@@ -24,3 +24,6 @@ yarn-error.log*
 
 # model binaries / large assets
 public/models/
+
+# models
+src/assets/*.glb
