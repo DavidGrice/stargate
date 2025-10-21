@@ -11,3 +11,14 @@ code {
   font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
     monospace;
 }
+
+/* Ensure the app and root containers fill the viewport and prevent accidental scrollbars */
+html, body, #root {
+  height: 100%;
+  overflow: hidden;
+}
+
+/* Make the main app element take full height so Three.js canvas can size to it */
+.App, .App > div, #root > .App {
+  height: 100%;
+}
