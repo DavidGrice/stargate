@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import { useEffect, useRef } from 'react';
 import * as THREE from 'three';
 
 export default function ThreeScene() {
@@ -10,50 +10,47 @@ export default function ThreeScene() {
 
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(60, container.clientWidth / container.clientHeight, 0.1, 1000);
-    camera.position.set(0, 1.5, 3);
+    camera.position.set(0, 1.6, 3);
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(container.clientWidth, container.clientHeight);
-    renderer.setPixelRatio(window.devicePixelRatio || 1);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     container.appendChild(renderer.domElement);
 
-    const light = new THREE.DirectionalLight(0xffffff, 1);
-    light.position.set(5, 10, 7.5);
+    const light = new THREE.HemisphereLight(0xffffff, 0x444444, 1.2);
     scene.add(light);
 
-    const geom = new THREE.TorusGeometry(0.8, 0.25, 16, 100);
-    const mat = new THREE.MeshStandardMaterial({ color: 0x156289, emissive: 0x072534, metalness: 0.3, roughness: 0.6 });
-    const torus = new THREE.Mesh(geom, mat);
+    // placeholder geometry (torus) instead of GLTF for incremental integration
+    const geo = new THREE.TorusGeometry(1, 0.3, 16, 100);
+    const mat = new THREE.MeshStandardMaterial({ color: 0x3366ff, metalness: 0.3, roughness: 0.5 });
+    const torus = new THREE.Mesh(geo, mat);
+    torus.name = 'placeholder-ring';
     scene.add(torus);
 
-    function onResize() {
-      const w = container.clientWidth;
-      const h = container.clientHeight;
-      camera.aspect = w / h;
+    let req = null;
+    const onResize = () => {
+      camera.aspect = container.clientWidth / container.clientHeight;
       camera.updateProjectionMatrix();
-      renderer.setSize(w, h);
-    }
+      renderer.setSize(container.clientWidth, container.clientHeight);
+    };
 
     window.addEventListener('resize', onResize);
 
-    let stopped = false;
-    function animate() {
-      if (stopped) return;
-      torus.rotation.x += 0.005;
+    const animate = () => {
       torus.rotation.y += 0.01;
       renderer.render(scene, camera);
-      requestAnimationFrame(animate);
-    }
+      req = requestAnimationFrame(animate);
+    };
 
     animate();
 
     return () => {
-      stopped = true;
       window.removeEventListener('resize', onResize);
+      if (req) cancelAnimationFrame(req);
       renderer.dispose();
       container.removeChild(renderer.domElement);
     };
   }, []);
 
-  return <div ref={containerRef} style={{ width: '100%', height: '60vh' }} />;
+  return <div ref={containerRef} style={{ width: '100%', height: '100vh' }} />;
 }
