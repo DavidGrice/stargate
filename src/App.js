@@ -1,5 +1,6 @@
-import logo from './logo.svg';
+﻿import logo from './logo.svg';
 import './App.css';
+import ThreeScene from './components/ThreeScene/ThreeScene';
 
 function App() {
   return (
@@ -18,6 +19,9 @@ function App() {
           Learn React
         </a>
       </header>
+      <main>
+        <ThreeScene />
+      </main>
     </div>
   );
 }
