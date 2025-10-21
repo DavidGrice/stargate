@@ -1,8 +1,10 @@
 import { useEffect, useRef } from 'react';
 import * as THREE from 'three';
+import useGLTFLoader from '../../hooks/useGLTFLoader';
 
 export default function ThreeScene() {
   const containerRef = useRef(null);
+  const model = useGLTFLoader('/models/stargate.glb');
 
   useEffect(() => {
     const container = containerRef.current;
@@ -23,9 +25,18 @@ export default function ThreeScene() {
     // placeholder geometry (torus) instead of GLTF for incremental integration
     const geo = new THREE.TorusGeometry(1, 0.3, 16, 100);
     const mat = new THREE.MeshStandardMaterial({ color: 0x3366ff, metalness: 0.3, roughness: 0.5 });
-    const torus = new THREE.Mesh(geo, mat);
+    let torus = new THREE.Mesh(geo, mat);
     torus.name = 'placeholder-ring';
     scene.add(torus);
+
+    // If a GLTF model is provided, attach it instead of the torus
+    if (model) {
+      // Remove placeholder and add model
+      scene.remove(torus);
+      model.position.set(0, 0, 0);
+      scene.add(model);
+      torus = null;
+    }
 
     let req = null;
     const onResize = () => {
@@ -37,7 +48,7 @@ export default function ThreeScene() {
     window.addEventListener('resize', onResize);
 
     const animate = () => {
-      torus.rotation.y += 0.01;
+      if (torus) torus.rotation.y += 0.01;
       renderer.render(scene, camera);
       req = requestAnimationFrame(animate);
     };
