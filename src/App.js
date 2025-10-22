@@ -33,7 +33,8 @@ function App() {
     alignmentTimeoutMs: 2500, // waitForAlignment timeout
     alignmentDistanceThreshold: 0.25, // distance threshold to consider aligned
     betweenRotatePauseMs: 400, // short pause between sequential rotations
-    strategy: 'shortest', // 'shortest'
+		strategy: 'shortest', // 'shortest'
+		postSequenceHoldMs: 1200, // keep DHD lights and dialer lit after full sequence
   });
   // When using 'alternate' strategy, flip direction each rotation starting with left (true)
   // alternate strategy removed - always use computed shortest delta
@@ -70,7 +71,18 @@ function App() {
     );
     const renderer = new THREE.WebGLRenderer();
     renderer.setSize(window.innerWidth, window.innerHeight);
-  mountNode.appendChild(renderer.domElement);
+	mountNode.appendChild(renderer.domElement);
+		// Resize handling: listen for window resizes and observe the mount node (handles devtools split panes)
+		let resizeObserver = null;
+		window.addEventListener('resize', handleResize);
+		try {
+			resizeObserver = new ResizeObserver(() => handleResize());
+			resizeObserver.observe(mountNode);
+		} catch (e) {
+			// ResizeObserver not available; fallback to window resize only
+		}
+		// Ensure initial sizing
+		handleResize();
   // Sky background (ensure visible even if mesh rendering order changes)
   // darker yellow as requested
   scene.background = new THREE.Color(0xE0C000);
@@ -95,13 +107,21 @@ function App() {
     directionalLight.position.set(5, 10, 7.5);
     scene.add(directionalLight);
     // Event handlers
-    const handleResize = () => {
-      camera.aspect = window.innerWidth / window.innerHeight;
-      camera.updateProjectionMatrix();
-      renderer.setSize(window.innerWidth, window.innerHeight);
-      renderer.setPixelRatio(window.devicePixelRatio || 1);
-      console.log('handleResize: renderer size set to', window.innerWidth, window.innerHeight, 'pixelRatio', window.devicePixelRatio);
-    };
+		function handleResize() {
+			try {
+				// Prefer the mount node's actual layout size (handles devtools/resizable panes)
+				const rect = mountNode.getBoundingClientRect();
+				const width = rect.width || window.innerWidth;
+				const height = rect.height || window.innerHeight;
+				camera.aspect = width / Math.max(1, height);
+				camera.updateProjectionMatrix();
+				// Use integer pixel sizes to avoid sub-pixel canvas issues
+				renderer.setSize(Math.max(1, Math.floor(width)), Math.max(1, Math.floor(height)), false);
+				renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+			} catch (e) {
+				console.warn('handleResize failed', e);
+			}
+		}
     // No fallback mouse-drag look. Pointer lock will only be requested on user click.
     const handlePointerLockChange = () => {
       const locked = document.pointerLockElement === renderer.domElement;
@@ -304,26 +324,44 @@ function App() {
                   }
                   child.visible = true;
                   // DHD registration
-                  if (key === 'dhd') {
-                    if (child.name.startsWith('glyph_') && child.name.endsWith('_plate')) {
-                      glyphPlateMeshes.set(child, child.material.clone());
-                      const glyphChild = child.children.find(c => c.name === child.name.replace('_plate', ''));
-                      const edgeChild = child.children.find(c => c.name === `${child.name.replace('_plate', '')}_edge`);
-                      if (glyphChild) { glyphMeshes.set(glyphChild, glyphChild.material.clone()); console.log('Registered DHD glyph plate:', child.name, 'child:', glyphChild.name); }
-                      if (edgeChild) { glyphEdgeMeshes.set(edgeChild, edgeChild.material.clone()); console.log('Registered DHD glyph edge:', edgeChild.name); }
-                    }
-                    if (child.name === 'dialer_button') { dialerMeshRef.current = child; console.log('Registered dialer_button (baked material preserved):', child.name); }
-                  }
+					if (key === 'dhd') {
+						if (child.name.startsWith('glyph_') && child.name.endsWith('_plate')) {
+							// store original plate material clone, then assign a modified copy to the plate
+							const originalPlateMat = child.material.clone();
+							glyphPlateMeshes.set(child, originalPlateMat);
+							// use a separate instance for the visible plate so we can tweak transparency/emissive
+							const visiblePlateMat = originalPlateMat.clone();
+							visiblePlateMat.transparent = true;
+							visiblePlateMat.opacity = 0.55;
+							// subtle emissive tint so plate glows slightly when lit via emissive color
+							try { visiblePlateMat.emissive = visiblePlateMat.emissive || new THREE.Color(0x050505); visiblePlateMat.emissive.setHex(0x050505); } catch(_){}
+							visiblePlateMat.needsUpdate = true;
+							child.material = visiblePlateMat;
+							const glyphChild = child.children.find(c => c.name === child.name.replace('_plate', ''));
+							const edgeChild = child.children.find(c => c.name === `${child.name.replace('_plate', '')}_edge`);
+							if (glyphChild) { glyphMeshes.set(glyphChild, glyphChild.material.clone()); console.log('Registered DHD glyph plate:', child.name, 'child:', glyphChild.name); }
+							if (edgeChild) { glyphEdgeMeshes.set(edgeChild, edgeChild.material.clone()); console.log('Registered DHD glyph edge:', edgeChild.name); }
+						}
+						if (child.name === 'dialer_button') { dialerMeshRef.current = child; console.log('Registered dialer_button (baked material preserved):', child.name); }
+					}
                   // Stargate plates/glyphs
-                  if (key === 'stargate' && child.name.startsWith('ring_') && child.name.endsWith('_plate')) {
-                    glyphPlateMeshes.set(child, child.material.clone());
-                    const baseName = child.name.replace('_plate', '');
-                    const glyphChild = child.children.find(c => c.name === `${baseName}_glyph`) || child.children.find(c => c.name === baseName);
-                    const edgeChild = child.children.find(c => c.name === `${baseName}_edge`) || child.children.find(c => c.name === `${baseName}_edge`);
-                    if (glyphChild) { stargateGlyphByName.set(glyphChild.name, glyphChild); stargateGlyphOriginalMaterials.set(glyphChild, glyphChild.material.clone()); console.log('Registered Stargate plate and glyph:', child.name, glyphChild.name); }
-                    else { console.log('Registered Stargate plate (no child glyph found yet):', child.name); }
-                    if (edgeChild) { glyphEdgeMeshes.set(edgeChild, edgeChild.material.clone()); console.log('Registered Stargate plate edge:', edgeChild.name); }
-                  }
+					if (key === 'stargate' && child.name.startsWith('ring_') && child.name.endsWith('_plate')) {
+						// store original plate material and assign a slightly transparent visible material
+						const originalPlateMat = child.material.clone();
+						glyphPlateMeshes.set(child, originalPlateMat);
+						const visiblePlateMat = originalPlateMat.clone();
+						visiblePlateMat.transparent = true;
+						visiblePlateMat.opacity = 0.6;
+						try { visiblePlateMat.emissive = visiblePlateMat.emissive || new THREE.Color(0x040404); visiblePlateMat.emissive.setHex(0x040404); } catch(_){}
+						visiblePlateMat.needsUpdate = true;
+						child.material = visiblePlateMat;
+						const baseName = child.name.replace('_plate', '');
+						const glyphChild = child.children.find(c => c.name === `${baseName}_glyph`) || child.children.find(c => c.name === baseName);
+						const edgeChild = child.children.find(c => c.name === `${baseName}_edge`) || child.children.find(c => c.name === `${baseName}_edge`);
+						if (glyphChild) { stargateGlyphByName.set(glyphChild.name, glyphChild); stargateGlyphOriginalMaterials.set(glyphChild, glyphChild.material.clone()); console.log('Registered Stargate plate and glyph:', child.name, glyphChild.name); }
+						else { console.log('Registered Stargate plate (no child glyph found yet):', child.name); }
+						if (edgeChild) { glyphEdgeMeshes.set(edgeChild, edgeChild.material.clone()); console.log('Registered Stargate plate edge:', edgeChild.name); }
+					}
                   if (key === 'stargate' && child.name.startsWith('ring_') && child.name.endsWith('_glyph')) {
                     if (!stargateGlyphByName.has(child.name)) { stargateGlyphByName.set(child.name, child); stargateGlyphOriginalMaterials.set(child, child.material.clone()); console.log('Registered Stargate glyph (direct node):', child.name); }
                   }
@@ -380,13 +418,13 @@ function App() {
         ]);
         // Add models to scene
         if (models.dhd) {
-          models.dhd.position.set(-5, 0, 15);
+          models.dhd.position.set(4, 0, 3);
           scene.add(models.dhd);
         } else {
           console.warn('DHD model failed to load; skipping');
         }
         if (models.stargate) {
-          models.stargate.position.set(2, 3, 0);
+          models.stargate.position.set(2, 2.4, 0);
           scene.add(models.stargate);
           // Ensure the stargate traverses itself to register plate->glyph mappings and angles
           try {
@@ -601,47 +639,100 @@ function App() {
             velocity.y = 0;
             canJump = true;
           }
-          // Update dialer_button emission (use ref to avoid stale closure)
-          if (selectedGlyphsRef.current.length === 7) {
-            setDialerEmissive(0xff0000);
-          } else {
-            setDialerEmissive(0);
-          }
+					// Update dialer_button emission (stay lit when the sequence is processing)
+					try {
+						if (selectedGlyphsRef.current.length === 7 || isProcessingRef.current) {
+							setDialerEmissive(0xff0000);
+						} else {
+							setDialerEmissive(0);
+						}
+					} catch (e) {
+						// defensive: ignore if refs not yet initialized
+					}
           // Raycasting for glyph hover
           if (dhdBoundingSphere) {
             const distanceToDHD = camera.position.distanceTo(dhdBoundingSphere.center);
             if (distanceToDHD <= dhdBoundingSphere.radius + maxInteractionDistance) {
               glyphRaycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
               const intersects = glyphRaycaster.intersectObjects([...Array.from(glyphPlateMeshes.keys()), dialerMeshRef.current].filter(Boolean), true);
-              if (currentHoveredGlyph && !selectedGlyphsRef.current.includes(currentHoveredGlyph)) {
-                currentHoveredGlyph.material.emissive.set(0, 0, 0);
-                currentHoveredGlyph.material = glyphMeshes.get(currentHoveredGlyph);
-                if (currentHoveredEdge) {
-                  currentHoveredEdge.material.emissive.set(0, 0, 0);
-                  currentHoveredEdge.material = glyphEdgeMeshes.get(currentHoveredEdge);
-                  currentHoveredEdge = null;
-                }
-                currentHoveredGlyph = null;
-              }
-              if (intersects.length > 0 && intersects[0].distance <= maxInteractionDistance) {
-                const hoveredObject = intersects[0].object;
-                if (glyphPlateMeshes.has(hoveredObject)) {
-                  const glyphName = hoveredObject.name.replace('_plate', '');
-                  const hoveredGlyph = hoveredObject.children.find(c => c.name === glyphName);
-                  const hoveredEdge = hoveredObject.children.find(c => c.name === `${glyphName}_edge`);
-                  if (hoveredGlyph && !selectedGlyphsRef.current.includes(hoveredGlyph) && hoveredGlyph !== currentHoveredGlyph) {
-                    console.log('Hovering glyph:', hoveredGlyph.name, 'at distance:', intersects[0].distance);
-                    hoveredGlyph.material = hoveredGlyph.material.clone();
-                    hoveredGlyph.material.emissive.set(0xADD8E6);
-                    if (hoveredEdge) {
-                      hoveredEdge.material = hoveredEdge.material.clone();
-                      hoveredEdge.material.emissive.set(0x87CEFA);
-                      currentHoveredEdge = hoveredEdge;
-                    }
-                    currentHoveredGlyph = hoveredGlyph;
-                  }
-                }
-              }
+							if (currentHoveredGlyph && !selectedGlyphsRef.current.includes(currentHoveredGlyph)) {
+								try {
+									if (currentHoveredGlyph.material && currentHoveredGlyph.material.emissive) {
+										currentHoveredGlyph.material.emissive.set(0, 0, 0);
+									}
+								} catch (_) {}
+								// restore original material if available
+								const origMat = glyphMeshes.get(currentHoveredGlyph);
+								if (origMat) {
+									try { currentHoveredGlyph.material = origMat; } catch (_) {}
+								}
+								if (currentHoveredEdge) {
+									try {
+										if (currentHoveredEdge.material && currentHoveredEdge.material.emissive) {
+											currentHoveredEdge.material.emissive.set(0, 0, 0);
+										}
+									} catch (_) {}
+									const origEdge = glyphEdgeMeshes.get(currentHoveredEdge);
+									if (origEdge) {
+										try { currentHoveredEdge.material = origEdge; } catch (_) {}
+									}
+									currentHoveredEdge = null;
+								}
+								currentHoveredGlyph = null;
+							}
+							if (intersects.length > 0 && intersects[0].distance <= maxInteractionDistance) {
+								// Resolve plate ancestor in case a child or nested node was hit
+								let hit = intersects[0].object;
+								let plate = null;
+								let tries = 0;
+								while (hit && tries < 6) {
+									if (glyphPlateMeshes.has(hit)) { plate = hit; break; }
+									hit = hit.parent;
+									tries += 1;
+								}
+								if (plate) {
+									const glyphName = plate.name.replace('_plate', '');
+									// prefer explicit child named `${glyphName}` or `${glyphName}_glyph`
+									const hoveredGlyph = plate.children.find(c => c.name === `${glyphName}_glyph`) || plate.children.find(c => c.name === glyphName) || plate.children.find(c => c.name && c.name.includes('glyph'));
+									const hoveredEdge = plate.children.find(c => c.name === `${glyphName}_edge`) || plate.children.find(c => (c.name || '').endsWith('_edge'));
+									if (hoveredGlyph && !selectedGlyphsRef.current.includes(hoveredGlyph) && hoveredGlyph !== currentHoveredGlyph) {
+										console.log('Hovering glyph:', hoveredGlyph.name, 'at distance:', intersects[0].distance);
+										// Prefer cloning the original stored material to avoid unexpected state
+										const storedOrig = glyphMeshes.get(hoveredGlyph);
+										let newGlyphMat = null;
+										try {
+											if (storedOrig && typeof storedOrig.clone === 'function') {
+												newGlyphMat = storedOrig.clone();
+											} else if (hoveredGlyph.material && typeof hoveredGlyph.material.clone === 'function') {
+												newGlyphMat = hoveredGlyph.material.clone();
+											}
+										} catch (_) { newGlyphMat = null; }
+										if (!newGlyphMat) {
+											// fallback: create a simple MeshStandardMaterial so UI still shows highlight
+											newGlyphMat = new THREE.MeshStandardMaterial({ color: 0xffffff });
+										}
+										try { if (newGlyphMat.emissive) newGlyphMat.emissive.set(0xADD8E6); } catch (_) {}
+										try { hoveredGlyph.material = newGlyphMat; } catch (_) {}
+										// clone and set emissive on edge if available (with similar fallbacks)
+										if (hoveredEdge) {
+											const storedEdgeOrig = glyphEdgeMeshes.get(hoveredEdge);
+											let newEdgeMat = null;
+											try {
+												if (storedEdgeOrig && typeof storedEdgeOrig.clone === 'function') {
+													newEdgeMat = storedEdgeOrig.clone();
+												} else if (hoveredEdge.material && typeof hoveredEdge.material.clone === 'function') {
+													newEdgeMat = hoveredEdge.material.clone();
+												}
+											} catch (_) { newEdgeMat = null; }
+											if (!newEdgeMat) newEdgeMat = new THREE.MeshStandardMaterial({ color: 0xffffff });
+											try { if (newEdgeMat.emissive) newEdgeMat.emissive.set(0x87CEFA); } catch (_) {}
+											try { hoveredEdge.material = newEdgeMat; } catch (_) {}
+											currentHoveredEdge = hoveredEdge;
+										}
+										currentHoveredGlyph = hoveredGlyph;
+									}
+								}
+							}
             } else if (currentHoveredGlyph && !selectedGlyphsRef.current.includes(currentHoveredGlyph)) {
               currentHoveredGlyph.material.emissive.set(0, 0, 0);
               currentHoveredGlyph.material = glyphMeshes.get(currentHoveredGlyph);
@@ -663,7 +754,7 @@ function App() {
           const mkGeoLarge = new THREE.SphereGeometry(0.09, 16, 16);
           // Make the lock marker clearly visible and blue for debugging
           const lockMat = new THREE.MeshBasicMaterial({ color: 0x0000ff });
-          const glyphMat = new THREE.MeshBasicMaterial({ color: 0x0000ff, opacity: 0.6, transparent: true });
+          const glyphMat = new THREE.MeshBasicMaterial({ color: 0x0000ff, opacity: 0.2, transparent: true });
           debugLockMarker = new THREE.Mesh(mkGeoSmall, lockMat);
           debugGlyphMarker = new THREE.Mesh(mkGeoLarge, glyphMat);
           // Keep glyph marker hidden until used, but show lock marker so its location is always clear
@@ -908,12 +999,14 @@ function App() {
               console.warn('Ring_Mat missing');
               return;
             }
-            console.log('processQueueSequence: starting, live queue length', selectedGlyphsRef.current.length);
-            isProcessingRef.current = true;
-            try {
-              // process the live selectedGlyphsRef queue (dequeue as we go)
-              let stepIndex = 0;
-              while (selectedGlyphsRef.current.length > 0) {
+					console.log('processQueueSequence: starting, live queue length', selectedGlyphsRef.current.length);
+					isProcessingRef.current = true;
+						// collect DHD glyphs/edges we should later restore after full sequence hold
+						let toRestoreDHD = [];
+						try {
+							// process the live selectedGlyphsRef queue (dequeue as we go)
+							let stepIndex = 0;
+							while (selectedGlyphsRef.current.length > 0) {
                 const glyphMesh = selectedGlyphsRef.current[0];
                 if (!glyphMesh) break;
                 // Resolve the stargate glyph target name. glyphMesh.name may be 'ring_xxx_glyph' or 'xxx_glyph' or 'xxx'
@@ -1004,20 +1097,20 @@ function App() {
                   await waitForAlignment(stMesh || glyphMesh, glyphName, (rotationConfigRef.current && rotationConfigRef.current.alignmentTimeoutMs) || 1500, (rotationConfigRef.current && rotationConfigRef.current.alignmentDistanceThreshold) || 0.25);
                   // hide debug markers after each step
                   try { if (debugGlyphMarker) debugGlyphMarker.visible = false; if (debugLockMarker) debugLockMarker.visible = false; } catch (_) {}
-                // After alignment (or timeout), dequeue the first selected glyph visual and restore materials
-                const currentQueue = selectedGlyphsRef.current;
-                if (currentQueue.length > 0) {
-                  const removed = currentQueue.shift();
-                  console.log('processQueueSequence: dequeued', removed.name, 'remaining', currentQueue.length);
-                  // restore DHD glyph material
-                  const orig = glyphMeshes.get(removed);
-                  if (orig) removed.material = orig;
-                  // restore edge
-                  const edge = Array.from(glyphEdgeMeshes.keys()).find(e => e && e.name === `${removed.name}_edge`);
-                  if (edge) {
-                    const origEdge = glyphEdgeMeshes.get(edge);
-                    if (origEdge) edge.material = origEdge;
-                  }
+								// After alignment (or timeout), dequeue the first selected glyph
+								const currentQueue = selectedGlyphsRef.current;
+								if (currentQueue.length > 0) {
+									const removed = currentQueue.shift();
+									console.log('processQueueSequence: dequeued', removed.name, 'remaining', currentQueue.length);
+									// Instead of restoring DHD glyphs immediately, collect them for later restoration
+									const orig = glyphMeshes.get(removed);
+									if (orig) toRestoreDHD.push({ mesh: removed, orig });
+									// collect edge if present
+									const edge = Array.from(glyphEdgeMeshes.keys()).find(e => e && e.name === `${removed.name}_edge`);
+									if (edge) {
+										const origEdge = glyphEdgeMeshes.get(edge);
+										if (origEdge) toRestoreDHD.push({ mesh: edge, orig: origEdge });
+									}
                   // restore stargate glyph material
                   // When restoring the corresponding stargate glyph, try several lookup patterns
                   const removedBase = removed.name.replace('_glyph', '').replace('_plate', '');
@@ -1042,12 +1135,33 @@ function App() {
                 const betweenPause = (rotationConfigRef.current && rotationConfigRef.current.betweenRotatePauseMs) || 150;
                 await new Promise(r => setTimeout(r, betweenPause));
               }
-            } catch (e) {
-              console.error('processQueueSequence failed:', e);
-            } finally {
-              isProcessingRef.current = false;
-              console.log('processing sequence complete');
-            }
+						} catch (e) {
+							console.error('processQueueSequence failed:', e);
+						} finally {
+							console.log('processing sequence complete; deferring restore for post-sequence hold');
+							try {
+								// Hold DHD glyph/button emissive for a short time after the full sequence, then restore
+								const holdMs = (rotationConfigRef.current && rotationConfigRef.current.postSequenceHoldMs) || 1200;
+								setTimeout(() => {
+									try {
+										// restore collected DHD glyphs/edges (if any)
+										if (typeof toRestoreDHD !== 'undefined' && Array.isArray(toRestoreDHD) && toRestoreDHD.length > 0) {
+											toRestoreDHD.forEach(({ mesh, orig }) => {
+												try { if (mesh && orig) mesh.material = orig; } catch (_) {}
+											});
+										}
+										// reset dialer emissive
+										try { setDialerEmissive(0); } catch (_) {}
+									} catch (_) {}
+									// Now mark processing as finished so animate loop can update accordingly
+									try { isProcessingRef.current = false; } catch (_) {}
+									console.log('post-sequence restore complete; isProcessing cleared');
+								}, holdMs);
+							} catch (_) {
+								// Ensure we clear processing flag even if scheduling the timeout fails
+								try { isProcessingRef.current = false; } catch (_) {}
+							}
+						}
           };
           window.processQueueSequence = processQueueSequence;
         // Finalize loading
@@ -1075,8 +1189,11 @@ function App() {
     // Start loading
     setupScene();
     // Cleanup
-    return () => {
-      window.removeEventListener('resize', handleResize);
+		return () => {
+			window.removeEventListener('resize', handleResize);
+			try {
+				if (resizeObserver && typeof resizeObserver.disconnect === 'function') resizeObserver.disconnect();
+			} catch (_) {}
       renderer.domElement.removeEventListener('click', handleClick);
       document.removeEventListener('pointerlockchange', handlePointerLockChange);
       document.removeEventListener('pointerlockerror', handlePointerLockError);
