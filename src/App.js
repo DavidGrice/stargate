@@ -137,13 +137,20 @@ function App() {
       renderer.domElement.requestPointerLock();
       // Raycast for glyph plate or dialer_button
         const mouse = new THREE.Vector2(0, 0); // Center-screen
-        glyphRaycaster.setFromCamera(mouse, camera);
-        const intersects = glyphRaycaster.intersectObjects([...Array.from(glyphPlateMeshes.keys()), dialerMeshRef.current].filter(Boolean), true);
+	glyphRaycaster.setFromCamera(mouse, camera);
+	const intersects = glyphRaycaster.intersectObjects([...Array.from(dhdPlateMeshes.keys()), dialerMeshRef.current].filter(Boolean), true);
         if (intersects.length > 0 && intersects[0].distance <= maxInteractionDistance) {
           const clickedObject = intersects[0].object;
           console.log('handleClick: clickedObject', clickedObject.name || clickedObject.type, 'distance', intersects[0].distance);
-          // Handle glyph plate click
-          if (glyphPlateMeshes.has(clickedObject)) {
+					// Handle glyph plate click (prefer DHD plates but fall back to stargate plates)
+					if (dhdPlateMeshes.has(clickedObject) || glyphPlateMeshes.has(clickedObject)) {
+						if (dhdPlateMeshes.has(clickedObject) && !glyphPlateMeshes.has(clickedObject)) {
+							console.log('handleClick: clicked DHD plate:', clickedObject.name);
+						} else if (glyphPlateMeshes.has(clickedObject) && !dhdPlateMeshes.has(clickedObject)) {
+							console.log('handleClick: clicked stargate plate:', clickedObject.name);
+						} else {
+							console.log('handleClick: clicked plate present in both maps (unexpected):', clickedObject.name);
+						}
             const plateBaseName = clickedObject.name.replace('_plate', '');
             // Try to find the glyph child under the plate using common patterns
             const glyphMesh = clickedObject.children.find(child => child.name === `${plateBaseName}_glyph`) || clickedObject.children.find(child => child.name === plateBaseName) || clickedObject.children.find(child => child.name && child.name.includes('glyph'));
@@ -274,7 +281,9 @@ function App() {
     const baseHeight = 1;
     const jumpStrength = 2;
     const models = { dhd: null, stargate: null };
-  const glyphPlateMeshes = new Map();
+	const glyphPlateMeshes = new Map();
+	// Separate map for DHD plate meshes (we only want to interact with DHD plates)
+	const dhdPlateMeshes = new Map();
   const glyphMeshes = new Map();
   const glyphEdgeMeshes = new Map();
   // Debug markers to visualize lock and sampled glyph points
@@ -328,7 +337,8 @@ function App() {
 						if (child.name.startsWith('glyph_') && child.name.endsWith('_plate')) {
 							// store original plate material clone, then assign a modified copy to the plate
 							const originalPlateMat = child.material.clone();
-							glyphPlateMeshes.set(child, originalPlateMat);
+							// record DHD plate into its own map so we don't touch stargate plates during interaction
+							dhdPlateMeshes.set(child, originalPlateMat);
 							// use a separate instance for the visible plate so we can tweak transparency/emissive
 							const visiblePlateMat = originalPlateMat.clone();
 							visiblePlateMat.transparent = true;
@@ -348,6 +358,7 @@ function App() {
 					if (key === 'stargate' && child.name.startsWith('ring_') && child.name.endsWith('_plate')) {
 						// store original plate material and assign a slightly transparent visible material
 						const originalPlateMat = child.material.clone();
+						// record stargate plates in glyphPlateMeshes for internal mapping, but interaction will ignore these
 						glyphPlateMeshes.set(child, originalPlateMat);
 						const visiblePlateMat = originalPlateMat.clone();
 						visiblePlateMat.transparent = true;
@@ -653,8 +664,8 @@ function App() {
           if (dhdBoundingSphere) {
             const distanceToDHD = camera.position.distanceTo(dhdBoundingSphere.center);
             if (distanceToDHD <= dhdBoundingSphere.radius + maxInteractionDistance) {
-              glyphRaycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
-              const intersects = glyphRaycaster.intersectObjects([...Array.from(glyphPlateMeshes.keys()), dialerMeshRef.current].filter(Boolean), true);
+			  glyphRaycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
+			  const intersects = glyphRaycaster.intersectObjects([...Array.from(dhdPlateMeshes.keys()), dialerMeshRef.current].filter(Boolean), true);
 							if (currentHoveredGlyph && !selectedGlyphsRef.current.includes(currentHoveredGlyph)) {
 								try {
 									if (currentHoveredGlyph.material && currentHoveredGlyph.material.emissive) {
@@ -686,7 +697,8 @@ function App() {
 								let plate = null;
 								let tries = 0;
 								while (hit && tries < 6) {
-									if (glyphPlateMeshes.has(hit)) { plate = hit; break; }
+									// only consider DHD plates as interactive plates
+									if (dhdPlateMeshes.has(hit)) { plate = hit; break; }
 									hit = hit.parent;
 									tries += 1;
 								}
@@ -708,8 +720,12 @@ function App() {
 											}
 										} catch (_) { newGlyphMat = null; }
 										if (!newGlyphMat) {
-											// fallback: create a simple MeshStandardMaterial so UI still shows highlight
-											newGlyphMat = new THREE.MeshStandardMaterial({ color: 0xffffff });
+											// fallback: try to preserve the hovered glyph's color when possible
+											let fallbackColor = 0xaaaaaa;
+											try {
+												if (hoveredGlyph.material && hoveredGlyph.material.color) fallbackColor = hoveredGlyph.material.color.getHex();
+											} catch (_) {}
+											newGlyphMat = new THREE.MeshStandardMaterial({ color: fallbackColor });
 										}
 										try { if (newGlyphMat.emissive) newGlyphMat.emissive.set(0xADD8E6); } catch (_) {}
 										try { hoveredGlyph.material = newGlyphMat; } catch (_) {}
@@ -724,7 +740,11 @@ function App() {
 													newEdgeMat = hoveredEdge.material.clone();
 												}
 											} catch (_) { newEdgeMat = null; }
-											if (!newEdgeMat) newEdgeMat = new THREE.MeshStandardMaterial({ color: 0xffffff });
+											if (!newEdgeMat) {
+												let fallbackEdgeColor = 0xaaaaaa;
+												try { if (hoveredEdge.material && hoveredEdge.material.color) fallbackEdgeColor = hoveredEdge.material.color.getHex(); } catch (_) {}
+												newEdgeMat = new THREE.MeshStandardMaterial({ color: fallbackEdgeColor });
+											}
 											try { if (newEdgeMat.emissive) newEdgeMat.emissive.set(0x87CEFA); } catch (_) {}
 											try { hoveredEdge.material = newEdgeMat; } catch (_) {}
 											currentHoveredEdge = hoveredEdge;
