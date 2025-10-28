@@ -27,8 +27,13 @@ function App() {
   const stargateGlyphBaseAnglesRef = useRef(new Map());
   const isProcessingRef = useRef(false);
   const rotationLockRef = useRef(false);
+	const whooshMeshRef = useRef(null);
+	const whooshUniformsRef = useRef(null);
+	const whooshAnimatingRef = useRef(false);
+	const whooshRAFRef = useRef(null);
+	const whooshPersistentRef = useRef(false);
   // Rotation configuration: tune these values to slow down/lengthen the visual sequence
-  const rotationConfigRef = useRef({
+	const rotationConfigRef = useRef({
     durationMs: 2200, // per-rotation animation duration
     postRotationPauseMs: 700, // pause after rotation before sampling
     alignmentTimeoutMs: 2500, // waitForAlignment timeout
@@ -37,6 +42,9 @@ function App() {
 		strategy: 'shortest', // 'shortest'
 		postSequenceHoldMs: 1200, // keep DHD lights and dialer lit after full sequence
 		lockPostHoldMs: 30000, // hold lock/chevron lights for 30s after sequence
+		// whoosh defaults
+		whooshFinalScale: 5.0,
+		whooshFadeBeforeMs: 600,
   });
   // When using 'alternate' strategy, flip direction each rotation starting with left (true)
   // alternate strategy removed - always use computed shortest delta
@@ -120,6 +128,12 @@ function App() {
 				// Use integer pixel sizes to avoid sub-pixel canvas issues
 				renderer.setSize(Math.max(1, Math.floor(width)), Math.max(1, Math.floor(height)), false);
 				renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+				// keep whoosh shader resolution uniform in sync
+				try {
+					if (whooshUniformsRef.current && whooshUniformsRef.current.uResolution) {
+						whooshUniformsRef.current.uResolution.value.set(Math.max(1, Math.floor(width)), Math.max(1, Math.floor(height)));
+					}
+				} catch (_) {}
 			} catch (e) {
 				console.warn('handleResize failed', e);
 			}
@@ -843,6 +857,332 @@ function App() {
             while (delta < -Math.PI) delta += Math.PI * 2;
             return delta;
           };
+
+			// Simple whoosh/ripple shader for the ring center. We'll create a circular mesh
+			// parented to Ring_Mat so it rotates with the gate. Uniforms: uTime, uProgress.
+			const whooshVertexShader = `
+				varying vec2 vUv;
+				varying vec3 vNormal;
+				uniform float uBubbleAmount;
+				uniform float uMaskRadius;
+				void main() {
+					vUv = uv;
+					vNormal = normal;
+					// compute radial distance from center (uv space where center is 0.5,0.5)
+					float r = length(uv - vec2(0.5));
+					// falloff: 1 at center, 0 at mask radius. Use a power to soften the bubble
+					float falloff = 0.0;
+					if (uMaskRadius > 0.0) {
+						float t = clamp(1.0 - (r / uMaskRadius), 0.0, 1.0);
+						falloff = pow(t, 1.5);
+					}
+					// displacement along the vertex normal
+					vec3 displaced = position + normalize(vNormal) * (uBubbleAmount * falloff);
+					gl_Position = projectionMatrix * modelViewMatrix * vec4(displaced, 1.0);
+				}
+			`;
+
+			// Top-level helper (within setupScene scope): compute whoosh mask radius in UV-space
+			// based on radial raycasts from the ring center into the stargate geometry.
+			const computeWhooshMaskRadius = () => {
+				try {
+					if (!ringMatRef.current) return 0.48;
+					const origin = ringMatRef.current.getWorldPosition(new THREE.Vector3());
+					const ray = new THREE.Raycaster();
+					const samples = 32;
+					const dists = [];
+					for (let i = 0; i < samples; i++) {
+						const a = (i / samples) * Math.PI * 2;
+						const dirLocal = new THREE.Vector3(Math.sin(a), 0, Math.cos(a));
+						const dirWorldPoint = ringMatRef.current.localToWorld(dirLocal.clone());
+						const dir = dirWorldPoint.sub(origin).normalize();
+						ray.set(origin, dir);
+						let targets = [];
+						if (models && models.stargate) targets = [models.stargate];
+						else if (typeof scene !== 'undefined' && scene) targets = [scene];
+						const intersects = ray.intersectObjects(targets, true);
+						if (intersects && intersects.length > 0) {
+							const p = intersects[0].point;
+							const dist = origin.distanceTo(p);
+							if (isFinite(dist) && dist > 0) dists.push(dist);
+						}
+					}
+					if (dists.length === 0) return 0.48;
+					dists.sort((a, b) => a - b);
+					const median = dists[Math.floor(dists.length / 2)];
+					let whooshWorldScale = 1.0;
+					if (whooshMeshRef.current && whooshMeshRef.current.scale) {
+						const ws = new THREE.Vector3(); whooshMeshRef.current.getWorldScale(ws); whooshWorldScale = ws.x || 1.0;
+					} else {
+						whooshWorldScale = (rotationConfigRef.current && rotationConfigRef.current.whooshFinalScale) || 3.5;
+					}
+					let uvRadius = (median / (whooshWorldScale * 1.0)) * 0.5;
+					uvRadius = Math.max(0.02, Math.min(0.5, uvRadius));
+					return uvRadius;
+				} catch (e) {
+					return 0.48;
+				}
+			};
+			const whooshFragmentShader = `
+				precision mediump float;
+				varying vec2 vUv;
+				varying vec3 vNormal;
+				uniform float uTime;
+				uniform float uProgress;
+				uniform float uIntensity;
+				uniform vec2 uResolution;
+				uniform float uBubbleAmount;
+				uniform float uMaskRadius;
+
+				#define SPIN_ROTATION -2.0
+				#define SPIN_SPEED 7.0
+				#define OFFSET vec2(0.0)
+				#define COLOUR_1 vec4(0.871, 0.267, 0.231, 1.0)
+				#define COLOUR_2 vec4(0.0, 0.42, 0.706, 1.0)
+				#define COLOUR_3 vec4(0.086, 0.137, 0.145, 1.0)
+				#define CONTRAST 3.5
+				#define LIGTHING 0.4
+				#define SPIN_AMOUNT 0.25
+				#define PIXEL_FILTER 745.0
+				#define SPIN_EASE 1.0
+				#define PI 3.14159265359
+				#define IS_ROTATE false
+
+				vec4 effect(vec2 screenSize, vec2 screen_coords) {
+					float pixel_size = length(screenSize.xy) / PIXEL_FILTER;
+					vec2 uv = (floor(screen_coords.xy*(1.0/ pixel_size))*pixel_size - 0.5*screenSize.xy)/length(screenSize.xy) - OFFSET;
+					float uv_len = length(uv);
+					float speed = (SPIN_ROTATION*SPIN_EASE*0.2);
+					if(IS_ROTATE){
+					   speed = uTime * speed;
+					}
+					speed += 302.2;
+					float new_pixel_angle = atan(uv.y, uv.x) + speed - SPIN_EASE*20.0*(1.0*SPIN_AMOUNT*uv_len + (1.0 - 1.0*SPIN_AMOUNT));
+					vec2 mid = (screenSize.xy/length(screenSize.xy))/2.0;
+					uv = (vec2((uv_len * cos(new_pixel_angle) + mid.x), (uv_len * sin(new_pixel_angle) + mid.y)) - mid);
+					uv *= 30.0;
+					speed = uTime*(SPIN_SPEED);
+					vec2 uv2 = vec2(uv.x+uv.y);
+					for(int i=0; i < 5; i++) {
+						uv2 += sin(max(uv.x, uv.y)) + uv;
+						uv  += 0.5*vec2(cos(5.1123314 + 0.353*uv2.y + speed*0.131121),sin(uv2.x - 0.113*speed));
+						uv  -= 1.0*cos(uv.x + uv.y) - 1.0*sin(uv.x*0.711 - uv.y);
+					}
+					float contrast_mod = (0.25*CONTRAST + 0.5*SPIN_AMOUNT + 1.2);
+					float paint_res = min(2.0, max(0.0,length(uv)*(0.035)*contrast_mod));
+					float c1p = max(0.0,1.0 - contrast_mod*abs(1.0-paint_res));
+					float c2p = max(0.0,1.0 - contrast_mod*abs(paint_res));
+					float c3p = 1.0 - min(1.0, c1p + c2p);
+					float light = (LIGTHING - 0.2)*max(c1p*5.0 - 4.0, 0.0) + LIGTHING*max(c2p*5.0 - 4.0, 0.0);
+					vec4 col = (0.3/CONTRAST)*COLOUR_1 + (1.0 - 0.3/CONTRAST)*(COLOUR_1*c1p + COLOUR_2*c2p + vec4(c3p*COLOUR_3.rgb, c3p*COLOUR_1.a)) + light;
+					col.rgb *= uIntensity * uProgress;
+					col.a *= clamp(uProgress, 0.0, 1.0);
+					return col;
+				}
+
+				void main(){
+					// mask fragments outside gate aperture to avoid protrusion
+					float d = length(vUv - vec2(0.5));
+					if (d > uMaskRadius) discard;
+					vec2 fragCoord = vUv * uResolution;
+					vec4 color = effect(uResolution, fragCoord);
+					// soften alpha near the mask edge
+					float edgeFade = smoothstep(uMaskRadius, uMaskRadius - 0.02, d);
+					color.a *= edgeFade;
+					gl_FragColor = color;
+				}
+			`;
+
+			const createWhooshMesh = () => {
+				try {
+					if (!ringMatRef.current) {
+						console.warn('createWhooshMesh: Ring_Mat not available, will attach to scene root instead');
+					}
+					const geo = new THREE.CircleGeometry(1.0, 64);
+					const uniforms = {
+						uTime: { value: 0 },
+						uProgress: { value: 0 },
+						uIntensity: { value: 3.0 },
+						uResolution: { value: new THREE.Vector2(window.innerWidth || 1024, window.innerHeight || 1024) },
+						uBubbleAmount: { value: 0.0 },
+						uMaskRadius: { value: computeWhooshMaskRadius() }
+					};
+					const mat = new THREE.ShaderMaterial({
+						transparent: true,
+						depthWrite: false,
+						uniforms,
+						vertexShader: whooshVertexShader,
+						fragmentShader: whooshFragmentShader,
+						side: THREE.DoubleSide,
+						blending: THREE.AdditiveBlending
+					});
+					const mesh = new THREE.Mesh(geo, mat);
+					mesh.name = '__ring_whoosh_mesh';
+					mesh.renderOrder = 998;
+					mesh.scale.set(0.001, 0.001, 0.001);
+					// orient the circle so it faces outward along the ring normal
+					try {
+						if (ringMatRef.current) {
+							ringMatRef.current.add(mesh);
+							mesh.position.set(0, 0, 0);
+							// ensure the circle plane faces the ring opening: align with ring local XZ plane
+							mesh.rotation.x = Math.PI * 0.5;
+						} else if (typeof scene !== 'undefined' && scene) {
+							scene.add(mesh);
+							mesh.position.set(0, 0, 0);
+							mesh.rotation.x = Math.PI * 0.5;
+						}
+					} catch (_) { }
+					// add a small point light helper for visibility on some hardware
+					try {
+						const pl = new THREE.PointLight(0x66ddff, 0.0, 8.0);
+						pl.name = '__whoosh_pl';
+						mesh.add(pl);
+					} catch (_) {}
+					whooshMeshRef.current = mesh;
+					whooshUniformsRef.current = uniforms;
+					console.log('createWhooshMesh: created whoosh mesh', mesh.name);
+					return mesh;
+				} catch (e) { console.warn('createWhooshMesh failed', e); return null; }
+			};
+
+			const activateWhoosh = (opts = {}) => {
+				return new Promise((resolve) => {
+					try {
+						if (whooshAnimatingRef.current) { console.debug('activateWhoosh: already animating'); return resolve(); }
+						whooshAnimatingRef.current = true;
+						if (!whooshMeshRef.current) createWhooshMesh();
+						const mesh = whooshMeshRef.current;
+						const uniforms = whooshUniformsRef.current;
+						if (!mesh || !uniforms) { whooshAnimatingRef.current = false; console.warn('activateWhoosh: missing mesh or uniforms'); return resolve(); }
+						console.log('activateWhoosh: starting whoosh animation on', mesh.name);
+						const light = mesh.getObjectByName && mesh.getObjectByName('__whoosh_pl');
+						const duration = typeof opts.duration === 'number' ? opts.duration : 1100;
+						const start = performance.now();
+						const maxScale = typeof opts.scale === 'number' ? opts.scale : 1.6;
+						const bubblePeak = (typeof opts.bubble === 'number') ? opts.bubble : Math.min(0.6, 0.18 * maxScale);
+						const animate = (now) => {
+							const t = Math.min(1, (now - start) / duration);
+							// progress envelope: 0 -> 1 -> 0
+							const prog = (t < 0.5) ? (t * 2.0) : (1.0 - (t - 0.5) * 2.0);
+							uniforms.uTime.value = (now - start) / 1000.0;
+							uniforms.uProgress.value = prog;
+							// animate bubble: peaks at mid-point then returns to zero
+							try { if (uniforms.uBubbleAmount) uniforms.uBubbleAmount.value = bubblePeak * prog; } catch(_) {}
+							const scale = 0.001 + maxScale * (0.4 + 0.6 * prog);
+							mesh.scale.set(scale, scale, scale);
+							mesh.visible = prog > 0.001;
+							// update mask radius to match transient whoosh scale so clipping stays accurate
+							try {
+								if (uniforms && typeof uniforms.uMaskRadius !== 'undefined') {
+									uniforms.uMaskRadius.value = computeWhooshMaskRadius();
+								}
+							} catch (_) {}
+							if (light && light.isLight) light.intensity = prog * 4.0;
+							if (t < 1) requestAnimationFrame(animate);
+							else {
+								// ensure final cleanup
+								uniforms.uProgress.value = 0;
+								if (light && light.isLight) light.intensity = 0;
+								mesh.visible = false;
+								whooshAnimatingRef.current = false;
+								console.log('activateWhoosh: completed');
+								resolve();
+							}
+						};
+						requestAnimationFrame(animate);
+					} catch (e) { whooshAnimatingRef.current = false; console.warn('activateWhoosh exception', e); resolve(); }
+				});
+			};
+
+			// Expose helpers for dev testing
+			window.createWhoosh = createWhooshMesh;
+			window.activateWhoosh = activateWhoosh;
+			// Persistent whoosh: show and hold until explicitly removed
+			const showPersistentWhoosh = (maxScale = (rotationConfigRef.current && rotationConfigRef.current.whooshFinalScale) || 3.5, growDuration = 400) => {
+				try {
+					if (!whooshMeshRef.current) createWhooshMesh();
+					const mesh = whooshMeshRef.current;
+					const uniforms = whooshUniformsRef.current;
+					if (!mesh || !uniforms) return;
+					// bump shader intensity for persistent display
+					try { if (uniforms.uIntensity) uniforms.uIntensity.value = 3.0; } catch (_) {}
+					whooshPersistentRef.current = true;
+					const start = performance.now();
+					const startScale = (mesh.scale && mesh.scale.x) ? mesh.scale.x : 0.001;
+					const targetScale = maxScale;
+					const grow = (now) => {
+						const t = Math.min(1, (now - start) / Math.max(1, growDuration));
+						const eased = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+						const scale = startScale + (targetScale - startScale) * eased;
+						mesh.scale.set(scale, scale, scale);
+						uniforms.uProgress.value = 1.0;
+						uniforms.uTime.value = (now - start) / 1000.0;
+						// ensure bubble relaxes to flat for persistent whoosh
+						try {
+							const startBubble = (uniforms.uBubbleAmount && typeof uniforms.uBubbleAmount.value === 'number') ? uniforms.uBubbleAmount.value : 0.0;
+							uniforms.uBubbleAmount.value = startBubble * (1.0 - eased);
+						} catch(_) {}
+						mesh.visible = true;
+						// recompute mask radius now that mesh world-scale is changing so the mask matches
+						try {
+							if (uniforms && typeof uniforms.uMaskRadius !== 'undefined') {
+								uniforms.uMaskRadius.value = computeWhooshMaskRadius();
+							}
+						} catch (_) {}
+						// ensure a visible point-light for persistent whoosh
+						try {
+							const pl = mesh.getObjectByName && mesh.getObjectByName('__whoosh_pl');
+							if (pl && pl.isLight) pl.intensity = 2.8;
+						} catch (_) {}
+						if (t < 1) whooshRAFRef.current = requestAnimationFrame(grow);
+						else {
+							// start persistent tick to update uTime
+							const tick = (n) => {
+								if (!whooshPersistentRef.current) return;
+								try { uniforms.uTime.value = (n - start) / 1000.0; } catch (_) {}
+								whooshRAFRef.current = requestAnimationFrame(tick);
+							};
+							whooshRAFRef.current = requestAnimationFrame(tick);
+						}
+					};
+					whooshRAFRef.current = requestAnimationFrame(grow);
+				} catch (e) { console.warn('showPersistentWhoosh failed', e); }
+			};
+			const removePersistentWhoosh = (fadeDuration = 300) => {
+				try {
+					if (!whooshMeshRef.current) return;
+					whooshPersistentRef.current = false;
+					if (whooshRAFRef.current) { try { cancelAnimationFrame(whooshRAFRef.current); } catch (_) {} whooshRAFRef.current = null; }
+					const mesh = whooshMeshRef.current;
+					const uniforms = whooshUniformsRef.current;
+					const start = performance.now();
+					const startScale = (mesh.scale && mesh.scale.x) ? mesh.scale.x : 1.0;
+					const light = mesh.getObjectByName && mesh.getObjectByName('__whoosh_pl');
+					const startLightIntensity = (light && light.isLight) ? light.intensity : 0;
+					const animateFade = (now) => {
+						const t = Math.min(1, (now - start) / Math.max(1, fadeDuration));
+						const eased = 1 - (1 - t) * (1 - t);
+						const scale = Math.max(0.001, startScale * (1 - eased));
+						try { mesh.scale.set(scale, scale, scale); } catch (_) {}
+						try { if (uniforms) uniforms.uProgress.value = Math.max(0, 1 - eased); } catch (_) {}
+						// fade bubble out as we remove the whoosh
+						try { if (uniforms && uniforms.uBubbleAmount) uniforms.uBubbleAmount.value = Math.max(0, (uniforms.uBubbleAmount.value || 0) * (1 - eased)); } catch(_) {}
+						try { if (light && light.isLight) light.intensity = Math.max(0, startLightIntensity * (1 - eased)); } catch (_) {}
+						if (t < 1) requestAnimationFrame(animateFade);
+						else {
+							try { if (uniforms) uniforms.uProgress.value = 0; } catch (_) {}
+							try { mesh.visible = false; } catch (_) {}
+							try { if (light && light.isLight) light.intensity = 0; } catch (_) {}
+							try { if (uniforms && uniforms.uBubbleAmount) uniforms.uBubbleAmount.value = 0; } catch(_) {}
+						}
+					};
+					requestAnimationFrame(animateFade);
+				} catch (e) { console.warn('removePersistentWhoosh failed', e); }
+			};
+			window.showPersistentWhoosh = showPersistentWhoosh;
+			window.removePersistentWhoosh = removePersistentWhoosh;
+
 					// Helper: animate a mesh by translating it along a world direction vector, expressed as a world offset
 					const animateTranslate = (mesh, worldOffsetVec, durationMs = 200) => {
 						return new Promise((resolve) => {
@@ -1060,7 +1400,7 @@ function App() {
 									anims.push(animateTranslate(light, worldOffset, animDuration));
 								} catch (_) {}
 							}
-							await Promise.all(anims);
+								await Promise.all(anims);
 							// set emissive for lights (leave materials modified until explicit restore)
 							for (const light of chevronLights) {
 								try {
@@ -1436,7 +1776,7 @@ function App() {
           };
           // Process the selected glyph queue sequentially: rotate then dequeue
           const processQueueSequence = async () => {
-            if (isProcessingRef.current) {
+				if (isProcessingRef.current) {
               console.warn('Sequence already running');
               return;
             }
@@ -1444,7 +1784,9 @@ function App() {
               console.warn('Ring_Mat missing');
               return;
             }
-					console.log('processQueueSequence: starting, live queue length', selectedGlyphsRef.current.length);
+					// capture the initial queue length so we can decide whether to play the whoosh at the end
+					const initialQueueLength = Array.isArray(selectedGlyphsRef.current) ? selectedGlyphsRef.current.length : 0;
+					console.log('processQueueSequence: starting, live queue length', initialQueueLength);
 					isProcessingRef.current = true;
 						// collect DHD glyphs/edges we should later restore after full sequence hold
 						let toRestoreDHD = [];
@@ -1597,6 +1939,21 @@ function App() {
 							try {
 								const lockHoldMs = (rotationConfigRef.current && rotationConfigRef.current.lockPostHoldMs) || 30000;
 								console.log('processQueueSequence: scheduling full restore after lockHoldMs (ms)', lockHoldMs);
+								// If the user queued exactly 7 glyphs, play a single persistent whoosh now
+								try {
+									if (initialQueueLength === 7 && typeof showPersistentWhoosh === 'function') {
+										console.log('processQueueSequence: playing final persistent whoosh after full sequence');
+										try {
+											const whooshScale = (rotationConfigRef.current && rotationConfigRef.current.whooshFinalScale) || 3.5;
+											const whooshFadeBefore = (rotationConfigRef.current && rotationConfigRef.current.whooshFadeBeforeMs) || 600;
+											showPersistentWhoosh(whooshScale, 400);
+											// schedule removal slightly before the lights are restored
+											const removeDelay = Math.max(0, lockHoldMs - whooshFadeBefore);
+											setTimeout(() => { try { if (typeof removePersistentWhoosh === 'function') removePersistentWhoosh(300); } catch (_) {} }, removeDelay);
+										} catch (_) {}
+									}
+								} catch (_) {}
+
 								setTimeout(() => {
 									try {
 										// restore collected DHD glyphs/edges (if any)
