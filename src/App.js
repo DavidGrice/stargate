@@ -1592,10 +1592,11 @@ function App() {
 						} catch (e) {
 							console.error('processQueueSequence failed:', e);
 						} finally {
-							console.log('processing sequence complete; deferring restore for post-sequence hold');
+							// Schedule a single, unified restore after the configured lock hold period so
+							// DHD glyphs, the dialer, and any chevron helpers are all restored together.
 							try {
-								// Hold DHD glyph/button emissive for a short time after the full sequence, then restore
-								const holdMs = (rotationConfigRef.current && rotationConfigRef.current.postSequenceHoldMs) || 1200;
+								const lockHoldMs = (rotationConfigRef.current && rotationConfigRef.current.lockPostHoldMs) || 30000;
+								console.log('processQueueSequence: scheduling full restore after lockHoldMs (ms)', lockHoldMs);
 								setTimeout(() => {
 									try {
 										// restore collected DHD glyphs/edges (if any)
@@ -1607,56 +1608,44 @@ function App() {
 										// reset dialer emissive
 										try { setDialerEmissive(0); } catch (_) {}
 									} catch (_) {}
-									// Now mark processing as finished so animate loop can update accordingly
-									try { isProcessingRef.current = false; } catch (_) {}
-									console.log('post-sequence restore complete; isProcessing cleared');
-									// Schedule lock/chevron restoration after configured hold (default 30s)
+									// Now restore any lock/chevron modifications and helpers
 									try {
-										const lockHoldMs = (rotationConfigRef.current && rotationConfigRef.current.lockPostHoldMs) || 30000;
-										setTimeout(() => {
-											try {
-												if (lockModifiedMeshes && lockModifiedMeshes.size > 0) {
-													for (const [mesh, rec] of lockModifiedMeshes.entries()) {
-														try {
-															if (mesh && rec && rec.origMat) {
-																try { mesh.material = rec.origMat; } catch (_) {}
-															}
-															// remove any helper objects we added
-															try {
-																if (rec && Array.isArray(rec.helpers)) {
-																	for (const h of rec.helpers) {
-																		try {
-																			if (h && h.parent) h.parent.remove(h);
-																			// dispose geometry/material on overlay helpers where appropriate
-																			try {
-																				if (h.geometry) h.geometry.dispose();
-																				if (h.material) {
-																					if (Array.isArray(h.material)) h.material.forEach(m => m.dispose());
-																					else h.material.dispose();
-																				}
-																			} catch (_) {}
-																		} catch (_) {}
-																	}
-																}
-															} catch (_) {}
-														} catch (_) {}
+										if (lockModifiedMeshes && lockModifiedMeshes.size > 0) {
+											for (const [mesh, rec] of lockModifiedMeshes.entries()) {
+												try {
+													if (mesh && rec && rec.origMat) {
+														try { mesh.material = rec.origMat; } catch (_) {}
 													}
-													lockModifiedMeshes.clear();
-												}
-											} catch (_) {}
-											console.log('lock/chevron materials restored after lockHoldMs');
-										}, lockHoldMs);
+													// remove any helper objects we added
+													try {
+														if (rec && Array.isArray(rec.helpers)) {
+															for (const h of rec.helpers) {
+																try {
+																	if (h && h.parent) h.parent.remove(h);
+																	// dispose geometry/material on overlay helpers where appropriate
+																	try {
+																		if (h.geometry) h.geometry.dispose();
+																		if (h.material) {
+																			if (Array.isArray(h.material)) h.material.forEach(m => m.dispose());
+																			else h.material.dispose();
+																		}
+																	} catch (_) {}
+																} catch (_) {}
+															}
+														}
+													} catch (_) {}
+												} catch (_) {}
+											}
+											try { lockModifiedMeshes.clear(); } catch (_) {}
+										}
 									} catch (_) {}
-								}, holdMs);
-							} catch (_) {
-									// Ensure we clear processing flag even if scheduling the timeout fails
+									// mark processing finished so the dialer/emissive logic in the render loop updates
 									try { isProcessingRef.current = false; } catch (_) {}
-								}
-								// NOTE: We want DHD glyphs and the dialer button to remain emissive until
-								// AFTER the lock hold timer (lockPostHoldMs). So instead of restoring
-								// DHD/dialer after a short post-sequence hold, defer their restoration
-								// until the lock hold timeout below. Move restoration into the lock restore
-								// so everything goes back to original materials together.
+									console.log('processQueueSequence: full restore complete (post lockHold)');
+								}, lockHoldMs);
+							} catch (e) {
+								try { isProcessingRef.current = false; } catch (_) {}
+							}
 						}
           };
           window.processQueueSequence = processQueueSequence;
