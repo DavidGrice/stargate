@@ -89,7 +89,7 @@ function App() {
   scene.background = new THREE.Color(0xE0C000);
   // Optional skybox mesh (kept for compatibility)
   const skyboxGeometry = new THREE.BoxGeometry(1000, 1000, 1000);
-  const skyboxMaterial = new THREE.MeshBasicMaterial({ color: 0xE0C000, side: THREE.BackSide });
+  const skyboxMaterial = new THREE.MeshBasicMaterial({ color: 0x000000, side: THREE.BackSide });
     const skybox = new THREE.Mesh(skyboxGeometry, skyboxMaterial);
     skybox.visible = true;
     scene.add(skybox);
@@ -320,10 +320,11 @@ function App() {
                     ringMatRef.current = child;
                     console.log('Registered Ring_Mat (non-mesh) during traverse');
                   }
-                  if (child.name === 'ring_lock_4') {
-                    ringLockRef.current = child;
-                    console.log('Registered ring_lock_4 (non-mesh) during traverse');
-                  }
+					// Register any ring_lock_* node (pick the first one encountered)
+					if (child.name && child.name.startsWith('ring_lock_') && !ringLockRef.current) {
+						ringLockRef.current = child;
+						console.log('Registered lock node during traverse:', child.name);
+					}
                 }
                 if (child.isMesh) {
                   if (!child.material || child.material.type === 'MeshBasicMaterial') {
@@ -380,17 +381,17 @@ function App() {
                     if (!stargateGlyphByName.has(child.name)) { stargateGlyphByName.set(child.name, child); stargateGlyphOriginalMaterials.set(child, child.material.clone()); console.log('Registered Stargate glyph (direct node):', child.name); }
                   }
                   if (key === 'stargate' && child.name === 'Ring_Mat') { ringMatRef.current = child; console.log('Registered Ring_Mat parent'); }
-                  if (key === 'stargate' && child.name === 'ring_lock_4') {
-                      ringLockRef.current = child;
-                      try {
-                        // look for a child named 'ring_lock_4_poi' which Blender authoring may have placed
-                        const poi = child.children.find(c => c.name === 'ring_lock_4_poi');
-                        if (poi) {
-                          ringLockPoiRef.current = poi;
-                          console.log('Registered ring_lock_4_poi child for lock sampling');
-                        }
-                      } catch (e) { console.warn('Failed to inspect ring_lock_4 children', e); }
-                    }
+						if (key === 'stargate' && child.name && child.name.startsWith('ring_lock_')) {
+								// if there's a POI child under this lock (e.g., ring_lock_X_poi) register it
+								if (!ringLockRef.current) ringLockRef.current = child;
+								try {
+									const poi = child.children.find(c => c.name && c.name.endsWith('_poi'));
+									if (poi) {
+										ringLockPoiRef.current = poi;
+										console.log('Registered lock POI child for lock sampling under', child.name);
+									}
+								} catch (e) { console.warn('Failed to inspect lock children', e); }
+							}
                 }
               });
               // finalize scene for this glTF and resolve
@@ -802,6 +803,9 @@ function App() {
 						return new Promise((resolve) => {
 							try {
 								const parent = mesh.parent || null;
+								// ensure matrices are fresh when sampling world positions
+								try { mesh.updateMatrixWorld(true); } catch (_) {}
+								try { if (parent) parent.updateMatrixWorld(true); } catch (_) {}
 								const worldPos = mesh.getWorldPosition(new THREE.Vector3());
 								const targetWorld = worldPos.clone().add(worldOffsetVec);
 								// Convert world positions to parent-local coordinates
@@ -829,21 +833,29 @@ function App() {
 					const animateLockChevronSequence = async (lockNode) => {
 						try {
 							if (!lockNode || !ringMatRef.current) return;
+							// Diagnostic: list children to help debug naming mismatches
+							try {
+								const childNames = [];
+								lockNode.traverse((c) => { if (c && c.name) childNames.push(c.name); });
+								console.debug('animateLockChevronSequence: lockNode children:', childNames);
+							} catch (_) {}
 							// collect children - support nested structure
 							const chevrons = [];
 							const chevronLights = [];
 							lockNode.traverse((c) => {
 								if (!c || !c.name) return;
 								const n = c.name.toLowerCase();
+								// Only match explicit chevron nodes (exclude lock root nodes like 'ring_lock_0')
 								if (n.includes('chevron') && !n.includes('light')) chevrons.push(c);
-								if (n.includes('chevron_light') || n.includes('chevronlight') || n.includes('chevron-light')) chevronLights.push(c);
+								if (n.includes('chevron_light') || n.includes('chevronlight') || n.includes('chevron-light') || n.includes('chev_light') || (n.includes('light') && n.includes('chev'))) chevronLights.push(c);
 							});
+							console.debug('animateLockChevronSequence: matched chevrons:', chevrons.map(c=>c.name), 'chevronLights:', chevronLights.map(c=>c.name));
 							if (chevrons.length === 0 && chevronLights.length === 0) return;
 							// compute ring center world point
 							const ringCenter = ringMatRef.current.getWorldPosition(new THREE.Vector3());
-							// animation distances (tweakable)
-							const outDistance = 0.12; // chevrons out
-							const inDistance = 0.08;  // lights in
+							// animation distances (tweakable) — reduced to slight motion
+							const outDistance = 0.04; // chevrons out (slight)
+							const inDistance = 0.03;  // lights in (slight)
 							const animDuration = 200;
 							const holdMs = 500;
 
@@ -852,46 +864,145 @@ function App() {
 							for (const ch of chevrons) {
 								try {
 									// record original material for later restoration
-									if (ch && !lockModifiedMeshes.has(ch)) {
-										try { lockModifiedMeshes.set(ch, ch.material); } catch (_) {}
+									if (ch) {
+										try { ch.updateMatrixWorld(true); } catch (_) {}
+										if (!lockModifiedMeshes.has(ch)) {
+											try { lockModifiedMeshes.set(ch, { origMat: (ch.isMesh ? ch.material : null), helpers: [] }); } catch (_) {}
+										}
 									}
-									const wp = ch.getWorldPosition(new THREE.Vector3());
-									const dir = wp.clone().sub(ringCenter);
-									dir.y = 0;
-									if (dir.lengthSq() === 0) continue;
-									dir.normalize();
+									// Prefer the mesh's forward (local Z) direction and fall back to radial from ring center
+									const dir = new THREE.Vector3();
+									try { ch.getWorldDirection(dir); } catch (_) {}
+									if (!dir || dir.lengthSq() === 0) {
+										const wp = ch.getWorldPosition(new THREE.Vector3());
+										const fallback = wp.clone().sub(ringCenter);
+										if (fallback.lengthSq() > 0) dir.copy(fallback).normalize();
+										else continue;
+									} else {
+										dir.normalize();
+									}
 									const worldOffset = dir.clone().multiplyScalar(outDistance);
 									anims.push(animateTranslate(ch, worldOffset, animDuration));
 								} catch (_) {}
 							}
 							for (const light of chevronLights) {
 								try {
+									// If this node is a Light (THREE.Light), adjust its color/intensity directly
+									if (light && light.isLight) {
+										try { light.updateMatrixWorld(true); } catch (_) {}
+										const wp = light.getWorldPosition(new THREE.Vector3());
+										const dir = wp.clone().sub(ringCenter);
+										if (!dir || dir.lengthSq() === 0) {
+											try { light.getWorldDirection(dir); } catch (_) {}
+											if (!dir || dir.lengthSq() === 0) continue;
+										}
+										dir.normalize();
+										const worldOffset = dir.clone().multiplyScalar(-inDistance);
+										// record original light props
+										if (!lockModifiedMeshes.has(light)) {
+											try { lockModifiedMeshes.set(light, { origMat: null, helpers: [{ color: light.color ? light.color.clone() : new THREE.Color(0xffffff), intensity: light.intensity }] }); } catch(_) {}
+										}
+										// set bright color/intensity
+										try { if (light.color) light.color.setHex(0x00ccff); } catch(_) {}
+										try { light.intensity = Math.max(1.6, (light.intensity || 0) + 1.2); } catch(_) {}
+										anims.push(animateTranslate(light, worldOffset, animDuration));
+										continue;
+									}
+									// Otherwise treat as mesh: Prefer radial direction from ring center; lights move inward (opposite radial)
+									if (light) {
+										try { light.updateMatrixWorld(true); } catch (_) {}
+									}
 									const wp = light.getWorldPosition(new THREE.Vector3());
 									const dir = wp.clone().sub(ringCenter);
-									dir.y = 0;
-									if (dir.lengthSq() === 0) continue;
+									if (!dir || dir.lengthSq() === 0) {
+										try { light.getWorldDirection(dir); } catch (_) {}
+										if (!dir || dir.lengthSq() === 0) continue;
+									}
 									dir.normalize();
-									// move inward (opposite direction)
 									const worldOffset = dir.clone().multiplyScalar(-inDistance);
-									// store original material and create a clone that supports emissive
+									// store original material record and create/assign a replacement that supports emissive
 									try {
 										if (light && !lockModifiedMeshes.has(light)) {
-											try { lockModifiedMeshes.set(light, light.material); } catch (_) {}
+											try { lockModifiedMeshes.set(light, { origMat: light.isMesh ? light.material : null, helpers: [] }); } catch (_) {}
 										}
+										const rec = lockModifiedMeshes.get(light);
+										const origMat = (rec && rec.origMat) ? rec.origMat : (light.isMesh ? light.material : null);
 										let newMat = null;
-										const orig = lockModifiedMeshes.get(light) || light.material;
-										try {
-											if (orig && typeof orig.clone === 'function') newMat = orig.clone();
-										} catch (_) { newMat = null; }
+										try { if (origMat && typeof origMat.clone === 'function') newMat = origMat.clone(); } catch (_) { newMat = null; }
 										if (!newMat) {
-											// fallback to a MeshStandardMaterial preserving base color if possible
 											let baseColor = 0xffffff;
-											try { if (orig && orig.color) baseColor = orig.color.getHex(); } catch (_) {}
+											try { if (origMat && origMat.color) baseColor = origMat.color.getHex(); } catch (_) {}
 											newMat = new THREE.MeshStandardMaterial({ color: baseColor });
 										}
-										// ensure emissive property exists
-										try { if (!('emissive' in newMat)) newMat.emissive = new THREE.Color(0x000000); } catch (_) {}
-										try { light.material = newMat; } catch (_) {}
+										// Force visible emissive for debugging/visibility
+										try {
+											newMat.color = newMat.color || new THREE.Color(0xffffff);
+											try { newMat.color.setHex(0xffffff); } catch (_) {}
+											newMat.emissive = new THREE.Color(0x00ccff);
+											newMat.emissiveIntensity = 10.0;
+										} catch (_) {}
+										try { if (light.isMesh) { light.material = newMat; light.material.needsUpdate = true; } } catch (err) { console.debug('animateLockChevronSequence: failed to set light.material', light && light.name, err); }
+										// add a small point light attached to the chevron_light mesh for guaranteed visibility
+											try {
+												if (light.isMesh) {
+													// avoid adding duplicate helpers
+													const existing = light.getObjectByName && light.getObjectByName('__chev_point_light');
+													if (!existing) {
+														const pl = new THREE.PointLight(0x00ccff, 2.0, 1.6);
+														pl.name = '__chev_point_light';
+														pl.position.set(0, 0, 0);
+														light.add(pl);
+														const updatedRec = lockModifiedMeshes.get(light) || { origMat: origMat, helpers: [] };
+														updatedRec.helpers = updatedRec.helpers || [];
+														updatedRec.helpers.push(pl);
+														lockModifiedMeshes.set(light, updatedRec);
+													}
+													// also add an emissive overlay mesh so we are not dependent on the original material supporting emissive
+													try {
+														const existingOverlay = light.getObjectByName && light.getObjectByName('__chev_emissive_overlay');
+														if (!existingOverlay && light.geometry) {
+															const overlayGeom = light.geometry.clone();
+															const overlayMat = new THREE.MeshBasicMaterial({ color: 0x00ccff, blending: THREE.AdditiveBlending, transparent: true, opacity: 0.9, depthWrite: false });
+															const overlay = new THREE.Mesh(overlayGeom, overlayMat);
+															overlay.name = '__chev_emissive_overlay';
+															overlay.renderOrder = 999;
+															// slight inflate to avoid z-fighting
+															overlay.scale.multiplyScalar(1.01);
+															overlay.frustumCulled = false;
+															light.add(overlay);
+															const upd = lockModifiedMeshes.get(light) || { origMat: origMat, helpers: [] };
+															upd.helpers = upd.helpers || [];
+															upd.helpers.push(overlay);
+															lockModifiedMeshes.set(light, upd);
+														}
+													} catch (_) {}
+													// If this is the specific chevron light under ring_lock_0, force-create a duplicated emissive mesh
+													try {
+														const lname = (light && light.name) ? light.name.toLowerCase() : '';
+														const lockName = (lockNode && lockNode.name) ? lockNode.name.toLowerCase() : '';
+														// For any ring_lock parent, if this child looks like a chevron_light, create a force-duplicate emissive overlay
+														if (lockName && lockName.includes('ring_lock') && lname && (lname.includes('chevron') && lname.includes('light') || lname.includes('chev') && lname.includes('light'))) {
+															const existingDupe = light.getObjectByName && light.getObjectByName('__chev_force_dupe');
+															if (!existingDupe && light.geometry) {
+																const dupeMat = new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: new THREE.Color(0x00ccff), emissiveIntensity: 6.0, transparent: true });
+																const dupe = new THREE.Mesh(light.geometry, dupeMat);
+																dupe.name = '__chev_force_dupe';
+																// copy transform
+																try { dupe.position.copy(light.position); } catch (_) {}
+																try { dupe.quaternion.copy(light.quaternion); } catch (_) {}
+																try { dupe.scale.copy(light.scale); } catch (_) {}
+																dupe.renderOrder = 1000;
+																dupe.frustumCulled = false;
+																light.add(dupe);
+																const rec2 = lockModifiedMeshes.get(light) || { origMat: origMat, helpers: [] };
+																rec2.helpers = rec2.helpers || [];
+																rec2.helpers.push(dupe);
+																lockModifiedMeshes.set(light, rec2);
+															}
+														}
+													} catch (_) {}
+												}
+											} catch (_) {}
 									} catch (_) {}
 									anims.push(animateTranslate(light, worldOffset, animDuration));
 								} catch (_) {}
@@ -899,7 +1010,25 @@ function App() {
 							await Promise.all(anims);
 							// set emissive for lights (leave materials modified until explicit restore)
 							for (const light of chevronLights) {
-								try { if (light.material && 'emissive' in light.material) light.material.emissive.set(0x87CEFA); } catch (_) {}
+								try {
+									if (light && light.material) {
+										// Some materials (MeshBasic) don't support emissive; ensure we have a Standard-like material
+										let mat = light.material;
+										if (!('emissive' in mat)) {
+											// Replace with a MeshStandardMaterial while preserving base color
+											const baseColor = (mat && mat.color && mat.color.getHex) ? mat.color.getHex() : 0xffffff;
+											const repl = new THREE.MeshStandardMaterial({ color: baseColor });
+											try { if (!lockModifiedMeshes.has(light)) lockModifiedMeshes.set(light, { origMat: mat, helpers: [] }); } catch (_) {}
+											mat = repl;
+											light.material = mat;
+										}
+										try { mat.color && mat.color.setHex && mat.color.setHex(0xffffff); } catch (_) {}
+										try { mat.emissive.setHex(0x00ccff); } catch (_) {}
+										try { mat.emissiveIntensity = 8.0; } catch (_) {}
+										try { mat.needsUpdate = true; } catch (_) {}
+										try { console.debug('animateLockChevronSequence: set emissive on', light.name, 'matType', mat.type); } catch(_){}
+									}
+								} catch (_) {}
 							}
 							// hold
 							await new Promise(r => setTimeout(r, holdMs));
@@ -909,8 +1038,10 @@ function App() {
 								try {
 									const wp = ch.getWorldPosition(new THREE.Vector3());
 									const dir = wp.clone().sub(ringCenter);
-									dir.y = 0;
-									if (dir.lengthSq() === 0) continue;
+									if (!dir || dir.lengthSq() === 0) {
+										try { ch.getWorldDirection(dir); } catch (_) {}
+										if (!dir || dir.lengthSq() === 0) continue;
+									}
 									dir.normalize();
 									const worldOffset = dir.clone().multiplyScalar(-outDistance);
 									revAnims.push(animateTranslate(ch, worldOffset, animDuration));
@@ -920,8 +1051,10 @@ function App() {
 								try {
 									const wp = light.getWorldPosition(new THREE.Vector3());
 									const dir = wp.clone().sub(ringCenter);
-									dir.y = 0;
-									if (dir.lengthSq() === 0) continue;
+									if (!dir || dir.lengthSq() === 0) {
+										try { light.getWorldDirection(dir); } catch (_) {}
+										if (!dir || dir.lengthSq() === 0) continue;
+									}
 									dir.normalize();
 									const worldOffset = dir.clone().multiplyScalar(inDistance);
 									revAnims.push(animateTranslate(light, worldOffset, animDuration));
@@ -934,10 +1067,22 @@ function App() {
 						}
 					};
 
-					const rotateRingToGlyph = (targetGlyphName, durationMs) => {
+					const rotateRingToGlyph = (targetGlyphName, durationMs, lockIndex = null) => {
             return new Promise((resolve, reject) => {
-              if (!ringMatRef.current) return reject(new Error('Ring_Mat not found'));
-              if (!ringLockRef.current) return reject(new Error('ring_lock_4 not found'));
+							if (!ringMatRef.current) return reject(new Error('Ring_Mat not found'));
+							// If we don't have a registered lock node, try to discover locks from the stargate model
+							if (!ringLockRef.current) {
+								try {
+									if (models && models.stargate) {
+										models.stargate.traverse((c) => {
+											if (!ringLockRef.current && c && c.name && c.name.toLowerCase().includes('ring_lock')) {
+												ringLockRef.current = c;
+												console.log('rotateRingToGlyph: discovered ringLockRef via models.stargate traverse:', c.name);
+											}
+										});
+									}
+								} catch (e) { /* ignore */ }
+							}
               const target = stargateGlyphByName.get(targetGlyphName);
               if (!target) return reject(new Error(`Target glyph ${targetGlyphName} not found`));
               if (rotationLockRef.current) return reject(new Error('Already processing rotation'));
@@ -1065,17 +1210,90 @@ function App() {
                     }
 										console.log('rotateRingToGlyph: completed animation', { newAngle: ringMatRef.current.rotation.y.toFixed(4) });
 										try {
-											// Trigger lock/chevron animation for the registered lock node (if present).
-											// This animates chevrons outward and chevron lights inward and sets a blue emissive briefly.
-											const lockNode = ringLockRef.current;
-											if (lockNode) {
-												// run asynchronously (do not block rotation promise)
-												(async () => {
+											// Trigger lock/chevron animation for available lock nodes.
+											// Prefer the registered ringLockRef, otherwise find all locks under models.stargate and animate each.
+											try {
+												// Find all ring_lock nodes (e.g. ring_lock_0, ring_lock_1, ring_lock_backside_0, etc.)
+												const locksToAnimateRaw = [];
+												try {
+													// Prefer scanning the loaded stargate model
+													if (models && models.stargate) {
+														models.stargate.traverse((c) => {
+															try {
+																if (c && c.name) {
+																	const n = c.name.toLowerCase();
+																	if (n.startsWith('ring_lock') || n.includes('ring_lock_') || /^ring_lock(_|$)/.test(n)) {
+																		locksToAnimateRaw.push(c);
+																	}
+																}
+															} catch (_) {}
+														});
+													}
+												} catch (_) {}
+												// Also consider the registered ringLockRef (it may be a single root); include its matching descendants
+												try {
+													if (ringLockRef.current) {
+														ringLockRef.current.traverse((c) => {
+															try {
+																if (c && c.name) {
+																	const n = c.name.toLowerCase();
+																	if (n.startsWith('ring_lock') || n.includes('ring_lock_')) locksToAnimateRaw.push(c);
+																}
+															} catch (_) {}
+														});
+													}
+												} catch (_) {}
+												// Fallback: scan entire scene if nothing found
+												try {
+													if (locksToAnimateRaw.length === 0 && typeof scene !== 'undefined' && scene) {
+														scene.traverse((c) => {
+															try {
+																if (c && c.name) {
+																	const n = c.name.toLowerCase();
+																	if (n.startsWith('ring_lock') || n.includes('ring_lock_')) locksToAnimateRaw.push(c);
+																}
+															} catch (_) {}
+														});
+													}
+												} catch (_) {}
+												// Deduplicate by name
+												const locksToAnimate = [];
+												try {
+													const seen = new Set();
+													for (const l of locksToAnimateRaw) {
+														if (l && l.name && !seen.has(l.name)) {
+															seen.add(l.name);
+															locksToAnimate.push(l);
+														}
+													}
+												} catch (_) {}
+												if (locksToAnimate.length > 0) {
 													try {
-														await animateLockChevronSequence(lockNode);
-													} catch (__animErr) { /* ignore animation errors */ }
-												})();
-											}
+														// Deterministic selection: if a lockIndex was provided use ring_lock_{index}
+														// otherwise fall back to the first discovered lock. This keeps behavior
+														// simple and predictable instead of attempting angular heuristics.
+														let selected = null;
+														if (typeof lockIndex === 'number' && !Number.isNaN(lockIndex)) {
+															// try exact name match first
+															const want = `ring_lock_${lockIndex}`;
+															for (const l of locksToAnimate) {
+																try {
+																	if (l && l.name && l.name.toLowerCase().includes(want)) { selected = l; break; }
+																} catch (_) {}
+															}
+														}
+														// fallback to first unique named lock if specific not found
+														if (!selected) selected = locksToAnimate[0];
+														if (selected) {
+															console.log('rotateRingToGlyph: animating selected lock (deterministic):', selected.name, 'requestedIndex:', lockIndex);
+															(async () => { try { await animateLockChevronSequence(selected); } catch (_) {} })();
+														}
+													} catch (e) {
+														// final fallback: animate first lock
+														try { (async () => { try { await animateLockChevronSequence(locksToAnimate[0]); } catch (_) {} })(); } catch (_) {}
+													}
+												}
+											} catch (_) {}
 										} catch (_) {}
 										resolve();
                   }
@@ -1210,7 +1428,15 @@ function App() {
                     stMesh = stargateGlyphByName.get(alt1) || stargateGlyphByName.get(alt2) || null;
                   }
                 }
-                await rotateRingToGlyph(glyphName, cfg.durationMs);
+				// Determine a deterministic lock index for this step (map glyph order -> ring_lock_{index}).
+				// Use stepIndex-1 because stepIndex was incremented above when logging the processing index.
+				try {
+					const lockIndexForThisStep = Math.max(0, stepIndex - 1) % 7;
+					await rotateRingToGlyph(glyphName, cfg.durationMs, lockIndexForThisStep);
+				} catch (e) {
+					// fallback to default rotation without explicit lock index
+					await rotateRingToGlyph(glyphName, cfg.durationMs);
+				}
                 // Pause to let world/visuals update after rotation
                 const postPause = cfg.postRotationPauseMs || 300;
                 console.log('processQueueSequence: rotation complete, pausing to let scene/world settle', { postPause });
@@ -1335,8 +1561,30 @@ function App() {
 										setTimeout(() => {
 											try {
 												if (lockModifiedMeshes && lockModifiedMeshes.size > 0) {
-													for (const [mesh, orig] of lockModifiedMeshes.entries()) {
-														try { if (mesh && orig) mesh.material = orig; } catch (_) {}
+													for (const [mesh, rec] of lockModifiedMeshes.entries()) {
+														try {
+															if (mesh && rec && rec.origMat) {
+																try { mesh.material = rec.origMat; } catch (_) {}
+															}
+															// remove any helper objects we added
+															try {
+																if (rec && Array.isArray(rec.helpers)) {
+																	for (const h of rec.helpers) {
+																		try {
+																			if (h && h.parent) h.parent.remove(h);
+																			// dispose geometry/material on overlay helpers where appropriate
+																			try {
+																				if (h.geometry) h.geometry.dispose();
+																				if (h.material) {
+																					if (Array.isArray(h.material)) h.material.forEach(m => m.dispose());
+																					else h.material.dispose();
+																				}
+																			} catch (_) {}
+																		} catch (_) {}
+																	}
+																}
+															} catch (_) {}
+														} catch (_) {}
 													}
 													lockModifiedMeshes.clear();
 												}
