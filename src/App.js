@@ -4,7 +4,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { PointerLockControls } from 'three/examples/jsm/controls/PointerLockControls.js';
 import LoadingModal from './components/LoadingModal/LoadingModal';
 import dhd from './assets/dhd.glb';
-import stargate from './assets/stargate.glb';
+import stargate from './assets/stargate_chevronlights.glb';
 import './App.css';
 
 
@@ -35,6 +35,7 @@ function App() {
     betweenRotatePauseMs: 400, // short pause between sequential rotations
 		strategy: 'shortest', // 'shortest'
 		postSequenceHoldMs: 1200, // keep DHD lights and dialer lit after full sequence
+		lockPostHoldMs: 30000, // hold lock/chevron lights for 30s after sequence
   });
   // When using 'alternate' strategy, flip direction each rotation starting with left (true)
   // alternate strategy removed - always use computed shortest delta
@@ -296,6 +297,8 @@ function App() {
   const stargatePlateBaseToGlyph = new Map();
   // Map plate base name -> author-placed poi (if exists)
   const stargatePlateBaseToPoi = new Map();
+	// Keep track of lock/chevron meshes whose materials we've modified so we can restore later
+	const lockModifiedMeshes = new Map(); // mesh -> originalMaterial
     const glyphRaycaster = new THREE.Raycaster();
     const maxInteractionDistance = 30; // Increased for large translations
     let currentHoveredGlyph = null;
@@ -785,7 +788,7 @@ function App() {
         } catch (e) {
           console.warn('Failed to create debug markers', e);
         }
-          // Rotation helper: rotate Ring_Mat so a target glyph aligns with ring_lock_4
+		  // Rotation helper: rotate Ring_Mat so a target glyph aligns with ring_lock_4
           // Precompute each glyph's local angle relative to Ring_Mat and the lock angle
           // We'll compute glyph and lock angles fresh on each rotation to avoid stale world positions
           const shortestAngle = (from, to) => {
@@ -794,7 +797,144 @@ function App() {
             while (delta < -Math.PI) delta += Math.PI * 2;
             return delta;
           };
-          const rotateRingToGlyph = (targetGlyphName, durationMs) => {
+					// Helper: animate a mesh by translating it along a world direction vector, expressed as a world offset
+					const animateTranslate = (mesh, worldOffsetVec, durationMs = 200) => {
+						return new Promise((resolve) => {
+							try {
+								const parent = mesh.parent || null;
+								const worldPos = mesh.getWorldPosition(new THREE.Vector3());
+								const targetWorld = worldPos.clone().add(worldOffsetVec);
+								// Convert world positions to parent-local coordinates
+								const startLocal = parent ? parent.worldToLocal(worldPos.clone()) : worldPos.clone();
+								const targetLocal = parent ? parent.worldToLocal(targetWorld.clone()) : targetWorld.clone();
+								const deltaLocal = targetLocal.clone().sub(startLocal);
+								const from = mesh.position.clone();
+								const to = from.clone().add(deltaLocal);
+								const start = performance.now();
+								const step = (now) => {
+									const t = Math.min(1, (now - start) / Math.max(1, durationMs));
+									// simple easeOutQuad
+									const eased = 1 - (1 - t) * (1 - t);
+									mesh.position.lerpVectors(from, to, eased);
+									if (t < 1) requestAnimationFrame(step);
+									else resolve();
+								};
+								requestAnimationFrame(step);
+							} catch (e) { resolve(); }
+						});
+					};
+
+					// Helper: run the chevron/light animation sequence on a lock node.
+					// chevrons move outward, chevron_lights move inward and light up blue briefly.
+					const animateLockChevronSequence = async (lockNode) => {
+						try {
+							if (!lockNode || !ringMatRef.current) return;
+							// collect children - support nested structure
+							const chevrons = [];
+							const chevronLights = [];
+							lockNode.traverse((c) => {
+								if (!c || !c.name) return;
+								const n = c.name.toLowerCase();
+								if (n.includes('chevron') && !n.includes('light')) chevrons.push(c);
+								if (n.includes('chevron_light') || n.includes('chevronlight') || n.includes('chevron-light')) chevronLights.push(c);
+							});
+							if (chevrons.length === 0 && chevronLights.length === 0) return;
+							// compute ring center world point
+							const ringCenter = ringMatRef.current.getWorldPosition(new THREE.Vector3());
+							// animation distances (tweakable)
+							const outDistance = 0.12; // chevrons out
+							const inDistance = 0.08;  // lights in
+							const animDuration = 200;
+							const holdMs = 500;
+
+							// animate all chevrons out and lights in in parallel
+							const anims = [];
+							for (const ch of chevrons) {
+								try {
+									// record original material for later restoration
+									if (ch && !lockModifiedMeshes.has(ch)) {
+										try { lockModifiedMeshes.set(ch, ch.material); } catch (_) {}
+									}
+									const wp = ch.getWorldPosition(new THREE.Vector3());
+									const dir = wp.clone().sub(ringCenter);
+									dir.y = 0;
+									if (dir.lengthSq() === 0) continue;
+									dir.normalize();
+									const worldOffset = dir.clone().multiplyScalar(outDistance);
+									anims.push(animateTranslate(ch, worldOffset, animDuration));
+								} catch (_) {}
+							}
+							for (const light of chevronLights) {
+								try {
+									const wp = light.getWorldPosition(new THREE.Vector3());
+									const dir = wp.clone().sub(ringCenter);
+									dir.y = 0;
+									if (dir.lengthSq() === 0) continue;
+									dir.normalize();
+									// move inward (opposite direction)
+									const worldOffset = dir.clone().multiplyScalar(-inDistance);
+									// store original material and create a clone that supports emissive
+									try {
+										if (light && !lockModifiedMeshes.has(light)) {
+											try { lockModifiedMeshes.set(light, light.material); } catch (_) {}
+										}
+										let newMat = null;
+										const orig = lockModifiedMeshes.get(light) || light.material;
+										try {
+											if (orig && typeof orig.clone === 'function') newMat = orig.clone();
+										} catch (_) { newMat = null; }
+										if (!newMat) {
+											// fallback to a MeshStandardMaterial preserving base color if possible
+											let baseColor = 0xffffff;
+											try { if (orig && orig.color) baseColor = orig.color.getHex(); } catch (_) {}
+											newMat = new THREE.MeshStandardMaterial({ color: baseColor });
+										}
+										// ensure emissive property exists
+										try { if (!('emissive' in newMat)) newMat.emissive = new THREE.Color(0x000000); } catch (_) {}
+										try { light.material = newMat; } catch (_) {}
+									} catch (_) {}
+									anims.push(animateTranslate(light, worldOffset, animDuration));
+								} catch (_) {}
+							}
+							await Promise.all(anims);
+							// set emissive for lights (leave materials modified until explicit restore)
+							for (const light of chevronLights) {
+								try { if (light.material && 'emissive' in light.material) light.material.emissive.set(0x87CEFA); } catch (_) {}
+							}
+							// hold
+							await new Promise(r => setTimeout(r, holdMs));
+							// reverse animations
+							const revAnims = [];
+							for (const ch of chevrons) {
+								try {
+									const wp = ch.getWorldPosition(new THREE.Vector3());
+									const dir = wp.clone().sub(ringCenter);
+									dir.y = 0;
+									if (dir.lengthSq() === 0) continue;
+									dir.normalize();
+									const worldOffset = dir.clone().multiplyScalar(-outDistance);
+									revAnims.push(animateTranslate(ch, worldOffset, animDuration));
+								} catch (_) {}
+							}
+							for (const light of chevronLights) {
+								try {
+									const wp = light.getWorldPosition(new THREE.Vector3());
+									const dir = wp.clone().sub(ringCenter);
+									dir.y = 0;
+									if (dir.lengthSq() === 0) continue;
+									dir.normalize();
+									const worldOffset = dir.clone().multiplyScalar(inDistance);
+									revAnims.push(animateTranslate(light, worldOffset, animDuration));
+									// do not restore materials here; restoration is deferred to the global lock restore
+								} catch (_) {}
+							}
+							await Promise.all(revAnims);
+						} catch (e) {
+							// ignore animation errors
+						}
+					};
+
+					const rotateRingToGlyph = (targetGlyphName, durationMs) => {
             return new Promise((resolve, reject) => {
               if (!ringMatRef.current) return reject(new Error('Ring_Mat not found'));
               if (!ringLockRef.current) return reject(new Error('ring_lock_4 not found'));
@@ -908,7 +1048,7 @@ function App() {
                 const from = currentAngle;
                 const to = currentAngle + appliedDelta;
                 console.log('rotateRingToGlyph: starting animation', { from: from.toFixed(4), to: to.toFixed(4), durationMs: actualDuration });
-                const animateRotate = (now) => {
+								const animateRotate = (now) => {
                   const t = Math.min(1, (now - start) / actualDuration);
                   const eased = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
                   ringMatRef.current.rotation.y = from + (to - from) * eased;
@@ -923,8 +1063,21 @@ function App() {
                     } catch (e) {
                       // ignore
                     }
-                    console.log('rotateRingToGlyph: completed animation', { newAngle: ringMatRef.current.rotation.y.toFixed(4) });
-                    resolve();
+										console.log('rotateRingToGlyph: completed animation', { newAngle: ringMatRef.current.rotation.y.toFixed(4) });
+										try {
+											// Trigger lock/chevron animation for the registered lock node (if present).
+											// This animates chevrons outward and chevron lights inward and sets a blue emissive briefly.
+											const lockNode = ringLockRef.current;
+											if (lockNode) {
+												// run asynchronously (do not block rotation promise)
+												(async () => {
+													try {
+														await animateLockChevronSequence(lockNode);
+													} catch (__animErr) { /* ignore animation errors */ }
+												})();
+											}
+										} catch (_) {}
+										resolve();
                   }
                 };
                 requestAnimationFrame(animateRotate);
@@ -1176,6 +1329,21 @@ function App() {
 									// Now mark processing as finished so animate loop can update accordingly
 									try { isProcessingRef.current = false; } catch (_) {}
 									console.log('post-sequence restore complete; isProcessing cleared');
+									// Schedule lock/chevron restoration after configured hold (default 30s)
+									try {
+										const lockHoldMs = (rotationConfigRef.current && rotationConfigRef.current.lockPostHoldMs) || 30000;
+										setTimeout(() => {
+											try {
+												if (lockModifiedMeshes && lockModifiedMeshes.size > 0) {
+													for (const [mesh, orig] of lockModifiedMeshes.entries()) {
+														try { if (mesh && orig) mesh.material = orig; } catch (_) {}
+													}
+													lockModifiedMeshes.clear();
+												}
+											} catch (_) {}
+											console.log('lock/chevron materials restored after lockHoldMs');
+										}, lockHoldMs);
+									} catch (_) {}
 								}, holdMs);
 							} catch (_) {
 								// Ensure we clear processing flag even if scheduling the timeout fails
