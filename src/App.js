@@ -23,6 +23,7 @@ function App() {
   const ringLockRef = useRef(null);
   const ringLockPoiRef = useRef(null);
   const ringLockBaseAngleRef = useRef(null);
+	const lock4BaseAngleRef = useRef(null);
   const stargateGlyphBaseAnglesRef = useRef(new Map());
   const isProcessingRef = useRef(false);
   const rotationLockRef = useRef(false);
@@ -449,43 +450,87 @@ function App() {
           } catch (e) {
             console.warn('registerStargateSelf failed:', e);
           }
+	 	 	 // compute and lock the 4th-chev lock angle as a stable constant used for rotations
+	 	 	 try {
+	 	 	 	 const computeLock4BaseAngle = () => {
+	 	 	 	 	 try {
+	 	 	 	 	 	 if (!ringMatRef.current) return null;
+	 	 	 	 	 	 const match = /ring_lock[_-]?4/i;
+	 	 	 	 	 	 let lock4 = null;
+	 	 	 	 	 	 if (models && models.stargate) {
+	 	 	 	 	 	 	 models.stargate.traverse((c) => { try { if (!lock4 && c && c.name && match.test(c.name)) lock4 = c; } catch (_) {} });
+	 	 	 	 	 	 }
+	 	 	 	 	 	 if (!lock4 && ringMatRef.current && ringMatRef.current.children) {
+	 	 	 	 	 	 	 for (const c of ringMatRef.current.children) { try { if (!lock4 && c && c.name && match.test(c.name)) { lock4 = c; break; } } catch(_) {} }
+	 	 	 	 	 	 }
+	 	 	 	 	 	 if (!lock4 && scene) { scene.traverse((c) => { try { if (!lock4 && c && c.name && match.test(c.name)) lock4 = c; } catch(_) {} }); }
+	 	 	 	 	 	 if (!lock4) return null;
+	 	 	 	 	 	 // prefer POI child
+	 	 	 	 	 	 let worldPos = new THREE.Vector3();
+	 	 	 	 	 	 const poi = (lock4.children || []).find(ch => ch && ch.name && ch.name.toLowerCase().endsWith('_poi')) || null;
+	 	 	 	 	 	 if (poi) { try { poi.updateMatrixWorld(true); poi.getWorldPosition(worldPos); } catch(_) {} }
+	 	 	 	 	 	 else if (lock4.isMesh && lock4.geometry) {
+	 	 	 	 	 	 	 try { if (!lock4.geometry.boundingBox) lock4.geometry.computeBoundingBox(); const lc = lock4.geometry.boundingBox.getCenter(new THREE.Vector3()); worldPos.copy(lc.applyMatrix4(lock4.matrixWorld)); } catch(_) {}
+	 	 	 	 	 	 } else { try { lock4.updateMatrixWorld(true); lock4.getWorldPosition(worldPos); } catch(_) {} }
+	 	 	 	 	 	 // convert to ring-local and compute angle
+	 	 	 	 	 	 try { const local = ringMatRef.current.worldToLocal(worldPos.clone()); return Math.atan2(local.x, local.z); } catch (_) { return null; }
+	 	 	 	 	 } catch (_) { return null; }
+	 	 	 	 };
+	 	 	 	 const a = computeLock4BaseAngle();
+	 	 	 	 if (typeof a === 'number') { lock4BaseAngleRef.current = a; console.log('Computed lock4BaseAngleRef:', a.toFixed(4)); }
+	 	 	 } catch (e) { console.warn('computeLock4BaseAngle failed', e); }
         } else {
           console.warn('Stargate model failed to load; skipping');
         }
         // Helper: return a reliable world-space point representing the lock focal point.
         // Preference order: ring_lock_4_poi child (author-placed), bounding-box center of ring_lock_4 mesh, fall back to ring_lock_4 world position
-        const getLockWorldPoint = () => {
-          const v = new THREE.Vector3();
-          if (!ringLockRef.current) return v;
-          ringLockRef.current.updateMatrixWorld(true);
-          if (ringLockPoiRef.current) {
-            try { ringLockPoiRef.current.updateMatrixWorld(true); ringLockPoiRef.current.getWorldPosition(v); return v; } catch (e) {}
-          }
-          if (ringLockRef.current.isMesh && ringLockRef.current.geometry) {
-            try {
-              const geo = ringLockRef.current.geometry;
-              if (!geo.boundingBox) geo.computeBoundingBox();
-              const localCenter = geo.boundingBox.getCenter(new THREE.Vector3());
-              const worldCenter = localCenter.clone().applyMatrix4(ringLockRef.current.matrixWorld);
-              v.copy(worldCenter);
-              return v;
-            } catch (e) {}
-          }
-          try { ringLockRef.current.getWorldPosition(v); } catch (e) {}
-          return v;
-        };
+								const getLockWorldPoint = () => {
+									const v = new THREE.Vector3();
+									if (!ringLockRef.current) return v;
+									ringLockRef.current.updateMatrixWorld(true);
+									if (ringLockPoiRef.current) {
+										try { ringLockPoiRef.current.updateMatrixWorld(true); ringLockPoiRef.current.getWorldPosition(v); return v; } catch (e) {}
+									}
+									if (ringLockRef.current.isMesh && ringLockRef.current.geometry) {
+										try {
+											const geo = ringLockRef.current.geometry;
+											if (!geo.boundingBox) geo.computeBoundingBox();
+											const localCenter = geo.boundingBox.getCenter(new THREE.Vector3());
+											const worldCenter = localCenter.clone().applyMatrix4(ringLockRef.current.matrixWorld);
+											v.copy(worldCenter);
+											return v;
+										} catch (e) {}
+									}
+									try { ringLockRef.current.getWorldPosition(v); } catch (e) {}
+									return v;
+								};
         // Precompute stable base angles for stargate glyphs and the lock
         function computeStargateBaseAngles() {
           try {
             if (!ringMatRef.current || !ringLockRef.current) return;
             ringMatRef.current.updateMatrixWorld(true);
             // Only set the lock base angle once, so it remains constant regardless of ring rotation
-            if (ringLockBaseAngleRef.current === null || typeof ringLockBaseAngleRef.current === 'undefined') {
-              const lockWorld = getLockWorldPoint();
-              const lockLocal = ringMatRef.current.worldToLocal(lockWorld.clone());
-              ringLockBaseAngleRef.current = Math.atan2(lockLocal.x, lockLocal.z);
-              console.log('Lock base angle set ONCE:', ringLockBaseAngleRef.current.toFixed(4));
-            }
+						if (ringLockBaseAngleRef.current === null || typeof ringLockBaseAngleRef.current === 'undefined') {
+							// Compute lock base angle without calling getLockWorldPoint to avoid TDZ issues
+							try {
+								const lockWorld = new THREE.Vector3();
+								if (ringLockPoiRef.current) {
+									ringLockPoiRef.current.updateMatrixWorld(true);
+									ringLockPoiRef.current.getWorldPosition(lockWorld);
+								} else if (ringLockRef.current && ringLockRef.current.isMesh && ringLockRef.current.geometry) {
+									if (!ringLockRef.current.geometry.boundingBox) ringLockRef.current.geometry.computeBoundingBox();
+									const localCenter = ringLockRef.current.geometry.boundingBox.getCenter(new THREE.Vector3());
+									lockWorld.copy(localCenter.applyMatrix4(ringLockRef.current.matrixWorld));
+								} else if (ringLockRef.current) {
+									ringLockRef.current.getWorldPosition(lockWorld);
+								}
+								const lockLocal = ringMatRef.current.worldToLocal(lockWorld.clone());
+								ringLockBaseAngleRef.current = Math.atan2(lockLocal.x, lockLocal.z);
+								console.log('Lock base angle set ONCE (inline):', ringLockBaseAngleRef.current.toFixed(4));
+							} catch (e) {
+								console.warn('Failed to compute lock base angle inline', e);
+							}
+						}
             const map = new Map();
             for (const [name, mesh] of stargateGlyphByName) {
               if (mesh) {
@@ -976,31 +1021,7 @@ function App() {
 															lockModifiedMeshes.set(light, upd);
 														}
 													} catch (_) {}
-													// If this is the specific chevron light under ring_lock_0, force-create a duplicated emissive mesh
-													try {
-														const lname = (light && light.name) ? light.name.toLowerCase() : '';
-														const lockName = (lockNode && lockNode.name) ? lockNode.name.toLowerCase() : '';
-														// For any ring_lock parent, if this child looks like a chevron_light, create a force-duplicate emissive overlay
-														if (lockName && lockName.includes('ring_lock') && lname && (lname.includes('chevron') && lname.includes('light') || lname.includes('chev') && lname.includes('light'))) {
-															const existingDupe = light.getObjectByName && light.getObjectByName('__chev_force_dupe');
-															if (!existingDupe && light.geometry) {
-																const dupeMat = new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: new THREE.Color(0x00ccff), emissiveIntensity: 6.0, transparent: true });
-																const dupe = new THREE.Mesh(light.geometry, dupeMat);
-																dupe.name = '__chev_force_dupe';
-																// copy transform
-																try { dupe.position.copy(light.position); } catch (_) {}
-																try { dupe.quaternion.copy(light.quaternion); } catch (_) {}
-																try { dupe.scale.copy(light.scale); } catch (_) {}
-																dupe.renderOrder = 1000;
-																dupe.frustumCulled = false;
-																light.add(dupe);
-																const rec2 = lockModifiedMeshes.get(light) || { origMat: origMat, helpers: [] };
-																rec2.helpers = rec2.helpers || [];
-																rec2.helpers.push(dupe);
-																lockModifiedMeshes.set(light, rec2);
-															}
-														}
-													} catch (_) {}
+													// (force-duplicate overlay removed — rely on emissive overlays and point lights)
 												}
 											} catch (_) {}
 									} catch (_) {}
@@ -1091,8 +1112,9 @@ function App() {
                 ringMatRef.current.updateMatrixWorld(true);
                 target.updateMatrixWorld(true);
                 ringLockRef.current.updateMatrixWorld(true);
-                const baseMap = stargateGlyphBaseAnglesRef.current;
-                const lockBase = ringLockBaseAngleRef.current;
+				const baseMap = stargateGlyphBaseAnglesRef.current;
+				// Prefer the explicit 4th-chevron base angle if we've computed it; otherwise fall back to the generic lock base
+				const lockBase = (lock4BaseAngleRef.current !== null && typeof lock4BaseAngleRef.current !== 'undefined') ? lock4BaseAngleRef.current : ringLockBaseAngleRef.current;
                 let desiredAngle = null;
                 // prepare logging/sample variables
                 let pTargetWorld = new THREE.Vector3();
@@ -1431,7 +1453,8 @@ function App() {
 				// Determine a deterministic lock index for this step (map glyph order -> ring_lock_{index}).
 				// Use stepIndex-1 because stepIndex was incremented above when logging the processing index.
 				try {
-					const lockIndexForThisStep = Math.max(0, stepIndex - 1) % 7;
+					// Map processing step to 1..7 (ring_lock_1 .. ring_lock_7)
+					const lockIndexForThisStep = ((Math.max(0, stepIndex - 1)) % 7) + 1;
 					await rotateRingToGlyph(glyphName, cfg.durationMs, lockIndexForThisStep);
 				} catch (e) {
 					// fallback to default rotation without explicit lock index
