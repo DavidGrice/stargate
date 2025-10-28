@@ -892,9 +892,41 @@ function App() {
 								const n = c.name.toLowerCase();
 								// Only match explicit chevron nodes (exclude lock root nodes like 'ring_lock_0')
 								if (n.includes('chevron') && !n.includes('light')) chevrons.push(c);
-								if (n.includes('chevron_light') || n.includes('chevronlight') || n.includes('chevron-light') || n.includes('chev_light') || (n.includes('light') && n.includes('chev'))) chevronLights.push(c);
+								// normalize mixed &&/|| precedence by grouping ORs and the AND into clear parentheses
+								const isChevronLight = (n.includes('chevron_light') || n.includes('chevronlight') || n.includes('chevron-light') || n.includes('chev_light')) || (n.includes('light') && n.includes('chev'));
+								if (isChevronLight) chevronLights.push(c);
 							});
 							console.debug('animateLockChevronSequence: matched chevrons:', chevrons.map(c=>c.name), 'chevronLights:', chevronLights.map(c=>c.name));
+							// Also include any separate ring_lock_lights_[n] meshes that are named outside the lock node
+							try {
+								const lockName = (lockNode && lockNode.name) ? lockNode.name.toLowerCase() : '';
+								// extract numeric index from lock name if present (e.g., ring_lock_4)
+								let lockIndex = null;
+								try {
+									const m = lockName.match(/ring_lock[_-]?(\d+)/i);
+									if (m && m[1]) lockIndex = m[1];
+								} catch (_) { lockIndex = null; }
+								// traverse scene to find complementary light groups named like `ring_lock_lights_4` or `ring_lock_light_4`
+								if (typeof scene !== 'undefined' && scene) {
+									scene.traverse((n) => {
+										try {
+											if (!n || !n.name) return;
+											const nn = n.name.toLowerCase();
+											// match 'ring_lock_lights_<index>' or 'ring_lock_light_<index>' or 'ring_lock_lights' containing index
+											if (lockIndex) {
+												if (nn.includes(`ring_lock_lights_${lockIndex}`) || nn.includes(`ring_lock_light_${lockIndex}`) || (nn.includes('ring_lock_lights') && nn.includes(lockIndex))) {
+													// avoid duplicates
+													if (!chevronLights.includes(n)) chevronLights.push(n);
+												}
+											}
+											// also allow generic 'ring_lock_lights' group without index
+											if (nn.includes('ring_lock_lights') && lockIndex === null) {
+												if (!chevronLights.includes(n)) chevronLights.push(n);
+											}
+										} catch (_) {}
+									});
+								}
+							} catch (_) {}
 							if (chevrons.length === 0 && chevronLights.length === 0) return;
 							// compute ring center world point
 							const ringCenter = ringMatRef.current.getWorldPosition(new THREE.Vector3());
@@ -1617,9 +1649,14 @@ function App() {
 									} catch (_) {}
 								}, holdMs);
 							} catch (_) {
-								// Ensure we clear processing flag even if scheduling the timeout fails
-								try { isProcessingRef.current = false; } catch (_) {}
-							}
+									// Ensure we clear processing flag even if scheduling the timeout fails
+									try { isProcessingRef.current = false; } catch (_) {}
+								}
+								// NOTE: We want DHD glyphs and the dialer button to remain emissive until
+								// AFTER the lock hold timer (lockPostHoldMs). So instead of restoring
+								// DHD/dialer after a short post-sequence hold, defer their restoration
+								// until the lock hold timeout below. Move restoration into the lock restore
+								// so everything goes back to original materials together.
 						}
           };
           window.processQueueSequence = processQueueSequence;
