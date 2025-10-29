@@ -32,6 +32,7 @@ function App() {
 	const whooshAnimatingRef = useRef(false);
 	const whooshRAFRef = useRef(null);
 	const whooshPersistentRef = useRef(false);
+	// Alternate whoosh refs removed — keeping only the primary whoosh state
   // Rotation configuration: tune these values to slow down/lengthen the visual sequence
 	const rotationConfigRef = useRef({
     durationMs: 2200, // per-rotation animation duration
@@ -43,7 +44,9 @@ function App() {
 		postSequenceHoldMs: 1200, // keep DHD lights and dialer lit after full sequence
 		lockPostHoldMs: 30000, // hold lock/chevron lights for 30s after sequence
 		// whoosh defaults
-		whooshFinalScale: 5.0,
+		// smaller configured whooshFinalScale yields a larger UV mask radius (less divisor),
+		// set to a modest default so the whoosh appears bigger and more consistent.
+		whooshFinalScale: 2.0,
 		whooshFadeBeforeMs: 600,
   });
   // When using 'alternate' strategy, flip direction each rotation starting with left (true)
@@ -860,27 +863,17 @@ function App() {
 
 			// Simple whoosh/ripple shader for the ring center. We'll create a circular mesh
 			// parented to Ring_Mat so it rotates with the gate. Uniforms: uTime, uProgress.
-			const whooshVertexShader = `
-				varying vec2 vUv;
-				varying vec3 vNormal;
-				uniform float uBubbleAmount;
-				uniform float uMaskRadius;
-				void main() {
-					vUv = uv;
-					vNormal = normal;
-					// compute radial distance from center (uv space where center is 0.5,0.5)
-					float r = length(uv - vec2(0.5));
-					// falloff: 1 at center, 0 at mask radius. Use a power to soften the bubble
-					float falloff = 0.0;
-					if (uMaskRadius > 0.0) {
-						float t = clamp(1.0 - (r / uMaskRadius), 0.0, 1.0);
-						falloff = pow(t, 1.5);
+				const whooshVertexShader = `
+					varying vec2 vUv;
+					varying vec3 vNormal;
+					// uMaskRadius is only used in the fragment shader for clipping; avoid declaring it here to prevent driver link issues
+					void main() {
+						vUv = uv;
+						vNormal = normal;
+						// No vertex displacement — render as a flat circular mesh
+						gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
 					}
-					// displacement along the vertex normal
-					vec3 displaced = position + normalize(vNormal) * (uBubbleAmount * falloff);
-					gl_Position = projectionMatrix * modelViewMatrix * vec4(displaced, 1.0);
-				}
-			`;
+				`;
 
 			// Top-level helper (within setupScene scope): compute whoosh mask radius in UV-space
 			// based on radial raycasts from the ring center into the stargate geometry.
@@ -889,7 +882,7 @@ function App() {
 					if (!ringMatRef.current) return 0.48;
 					const origin = ringMatRef.current.getWorldPosition(new THREE.Vector3());
 					const ray = new THREE.Raycaster();
-					const samples = 32;
+					const samples = 16;
 					const dists = [];
 					for (let i = 0; i < samples; i++) {
 						const a = (i / samples) * Math.PI * 2;
@@ -910,14 +903,13 @@ function App() {
 					if (dists.length === 0) return 0.48;
 					dists.sort((a, b) => a - b);
 					const median = dists[Math.floor(dists.length / 2)];
-					let whooshWorldScale = 1.0;
-					if (whooshMeshRef.current && whooshMeshRef.current.scale) {
-						const ws = new THREE.Vector3(); whooshMeshRef.current.getWorldScale(ws); whooshWorldScale = ws.x || 1.0;
-					} else {
-						whooshWorldScale = (rotationConfigRef.current && rotationConfigRef.current.whooshFinalScale) || 3.5;
-					}
+					// Use a stable configured whoosh world-scale rather than the current mesh scale, which
+					// may vary between runs and cause inconsistent mask radius computation.
+					const whooshWorldScale = (rotationConfigRef.current && rotationConfigRef.current.whooshFinalScale) || 3.5;
 					let uvRadius = (median / (whooshWorldScale * 1.0)) * 0.5;
-					uvRadius = Math.max(0.02, Math.min(0.5, uvRadius));
+					// Enforce a reasonable minimum so the mask does not collapse to a tiny value
+					// (this keeps the whoosh visible even when sampling returns small distances).
+					uvRadius = Math.max(0.22, Math.min(0.5, uvRadius));
 					return uvRadius;
 				} catch (e) {
 					return 0.48;
@@ -927,12 +919,11 @@ function App() {
 				precision mediump float;
 				varying vec2 vUv;
 				varying vec3 vNormal;
-				uniform float uTime;
-				uniform float uProgress;
-				uniform float uIntensity;
-				uniform vec2 uResolution;
-				uniform float uBubbleAmount;
-				uniform float uMaskRadius;
+						uniform float uTime;
+						uniform float uProgress;
+						uniform float uIntensity;
+						uniform vec2 uResolution;
+						uniform float uMaskRadius;
 
 				#define SPIN_ROTATION -2.0
 				#define SPIN_SPEED 7.0
@@ -975,7 +966,8 @@ function App() {
 					float c3p = 1.0 - min(1.0, c1p + c2p);
 					float light = (LIGTHING - 0.2)*max(c1p*5.0 - 4.0, 0.0) + LIGTHING*max(c2p*5.0 - 4.0, 0.0);
 					vec4 col = (0.3/CONTRAST)*COLOUR_1 + (1.0 - 0.3/CONTRAST)*(COLOUR_1*c1p + COLOUR_2*c2p + vec4(c3p*COLOUR_3.rgb, c3p*COLOUR_1.a)) + light;
-					col.rgb *= uIntensity * uProgress;
+						// simple intensity modulation (no bubble displacement)
+						col.rgb *= uIntensity * uProgress;
 					col.a *= clamp(uProgress, 0.0, 1.0);
 					return col;
 				}
@@ -999,13 +991,15 @@ function App() {
 						console.warn('createWhooshMesh: Ring_Mat not available, will attach to scene root instead');
 					}
 					const geo = new THREE.CircleGeometry(1.0, 64);
+					// compute mask radius defensively
+					let initialMask = 0.48;
+					try { initialMask = computeWhooshMaskRadius(); } catch (_) { initialMask = 0.48; }
 					const uniforms = {
 						uTime: { value: 0 },
 						uProgress: { value: 0 },
 						uIntensity: { value: 3.0 },
 						uResolution: { value: new THREE.Vector2(window.innerWidth || 1024, window.innerHeight || 1024) },
-						uBubbleAmount: { value: 0.0 },
-						uMaskRadius: { value: computeWhooshMaskRadius() }
+						uMaskRadius: { value: initialMask }
 					};
 					const mat = new THREE.ShaderMaterial({
 						transparent: true,
@@ -1019,18 +1013,27 @@ function App() {
 					const mesh = new THREE.Mesh(geo, mat);
 					mesh.name = '__ring_whoosh_mesh';
 					mesh.renderOrder = 998;
-					mesh.scale.set(0.001, 0.001, 0.001);
+					// Start at a visible default scale derived from the configured whooshFinalScale
+					const defaultWhooshScale = (rotationConfigRef.current && rotationConfigRef.current.whooshFinalScale) ? (rotationConfigRef.current.whooshFinalScale * 0.9) : 2.0 * 0.9;
+					mesh.scale.set(defaultWhooshScale, defaultWhooshScale, defaultWhooshScale);
+					mesh.frustumCulled = false;
+					mesh.visible = true;
 					// orient the circle so it faces outward along the ring normal
 					try {
+						let attached = false;
 						if (ringMatRef.current) {
 							ringMatRef.current.add(mesh);
 							mesh.position.set(0, 0, 0);
-							// ensure the circle plane faces the ring opening: align with ring local XZ plane
 							mesh.rotation.x = Math.PI * 0.5;
+							attached = true;
 						} else if (typeof scene !== 'undefined' && scene) {
 							scene.add(mesh);
 							mesh.position.set(0, 0, 0);
 							mesh.rotation.x = Math.PI * 0.5;
+							attached = true;
+						}
+						if (!attached) {
+							console.warn('createWhooshMesh: failed to attach whoosh mesh to ring or scene; it may be invisible until attached.');
 						}
 					} catch (_) { }
 					// add a small point light helper for visibility on some hardware
@@ -1041,10 +1044,14 @@ function App() {
 					} catch (_) {}
 					whooshMeshRef.current = mesh;
 					whooshUniformsRef.current = uniforms;
-					console.log('createWhooshMesh: created whoosh mesh', mesh.name);
+					console.log('createWhooshMesh: created whoosh mesh', mesh.name, 'maskRadius', uniforms.uMaskRadius && uniforms.uMaskRadius.value);
 					return mesh;
 				} catch (e) { console.warn('createWhooshMesh failed', e); return null; }
 			};
+
+				// Alternate whoosh shaders removed — using primary whoosh only
+
+				// Removed third alternate whoosh shader and helpers — using primary whoosh only
 
 			const activateWhoosh = (opts = {}) => {
 				return new Promise((resolve) => {
@@ -1059,34 +1066,44 @@ function App() {
 						const light = mesh.getObjectByName && mesh.getObjectByName('__whoosh_pl');
 						const duration = typeof opts.duration === 'number' ? opts.duration : 1100;
 						const start = performance.now();
-						const maxScale = typeof opts.scale === 'number' ? opts.scale : 1.6;
-						const bubblePeak = (typeof opts.bubble === 'number') ? opts.bubble : Math.min(0.6, 0.18 * maxScale);
+						// transient whoosh visual scale; increase default for a larger visible ripple
+						const maxScale = typeof opts.scale === 'number' ? opts.scale : 3.5;
+						let computedMask = undefined;
+						try {
+							if (uniforms && typeof uniforms.uMaskRadius !== 'undefined') {
+								computedMask = Math.max(0.22, Math.min(0.5, computeWhooshMaskRadius()));
+								uniforms.uMaskRadius.value = computedMask;
+							}
+						} catch (_) {}
 						const animate = (now) => {
 							const t = Math.min(1, (now - start) / duration);
 							// progress envelope: 0 -> 1 -> 0
 							const prog = (t < 0.5) ? (t * 2.0) : (1.0 - (t - 0.5) * 2.0);
 							uniforms.uTime.value = (now - start) / 1000.0;
 							uniforms.uProgress.value = prog;
-							// animate bubble: peaks at mid-point then returns to zero
-							try { if (uniforms.uBubbleAmount) uniforms.uBubbleAmount.value = bubblePeak * prog; } catch(_) {}
+							// bubble disabled: no vertex displacement, nothing to update here
 							const scale = 0.001 + maxScale * (0.4 + 0.6 * prog);
 							mesh.scale.set(scale, scale, scale);
 							mesh.visible = prog > 0.001;
-							// update mask radius to match transient whoosh scale so clipping stays accurate
-							try {
-								if (uniforms && typeof uniforms.uMaskRadius !== 'undefined') {
-									uniforms.uMaskRadius.value = computeWhooshMaskRadius();
-								}
-							} catch (_) {}
+							// mask radius computed once before animation (see below) to avoid per-frame jitter
 							if (light && light.isLight) light.intensity = prog * 4.0;
 							if (t < 1) requestAnimationFrame(animate);
 							else {
-								// ensure final cleanup
-								uniforms.uProgress.value = 0;
-								if (light && light.isLight) light.intensity = 0;
-								mesh.visible = false;
-								whooshAnimatingRef.current = false;
-								console.log('activateWhoosh: completed');
+								try {
+									// end of transient animation: reset progress and visibility
+									try { uniforms.uProgress.value = 0; } catch (_) {}
+									try { if (light && light.isLight) light.intensity = 0; } catch(_) {}
+									try { mesh.visible = false; } catch(_) {}
+									whooshAnimatingRef.current = false;
+									// restore the precomputed mask radius (or recompute defensively if missing)
+									try {
+										if (uniforms && typeof uniforms.uMaskRadius !== 'undefined') {
+											if (typeof computedMask !== 'undefined') uniforms.uMaskRadius.value = computedMask;
+											else { const computed = computeWhooshMaskRadius(); uniforms.uMaskRadius.value = Math.max(0.22, Math.min(0.5, computed)); }
+										}
+									} catch (_) {}
+								} catch (_) {}
+								// resolve the activateWhoosh promise so callers continue
 								resolve();
 							}
 						};
@@ -1111,6 +1128,14 @@ function App() {
 					const start = performance.now();
 					const startScale = (mesh.scale && mesh.scale.x) ? mesh.scale.x : 0.001;
 					const targetScale = maxScale;
+					// compute mask radius once for the persistent whoosh so it remains stable while scaling
+					let persistentComputedMask = undefined;
+					try {
+						if (uniforms && typeof uniforms.uMaskRadius !== 'undefined') {
+							persistentComputedMask = Math.max(0.22, Math.min(0.5, computeWhooshMaskRadius()));
+							uniforms.uMaskRadius.value = persistentComputedMask;
+						}
+					} catch (_) {}
 					const grow = (now) => {
 						const t = Math.min(1, (now - start) / Math.max(1, growDuration));
 						const eased = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
@@ -1118,18 +1143,9 @@ function App() {
 						mesh.scale.set(scale, scale, scale);
 						uniforms.uProgress.value = 1.0;
 						uniforms.uTime.value = (now - start) / 1000.0;
-						// ensure bubble relaxes to flat for persistent whoosh
-						try {
-							const startBubble = (uniforms.uBubbleAmount && typeof uniforms.uBubbleAmount.value === 'number') ? uniforms.uBubbleAmount.value : 0.0;
-							uniforms.uBubbleAmount.value = startBubble * (1.0 - eased);
-						} catch(_) {}
+							// bubble disabled for persistent whoosh — nothing to relax
 						mesh.visible = true;
-						// recompute mask radius now that mesh world-scale is changing so the mask matches
-						try {
-							if (uniforms && typeof uniforms.uMaskRadius !== 'undefined') {
-								uniforms.uMaskRadius.value = computeWhooshMaskRadius();
-							}
-						} catch (_) {}
+						// mask radius was precomputed above; do not recompute per-frame to avoid jitter
 						// ensure a visible point-light for persistent whoosh
 						try {
 							const pl = mesh.getObjectByName && mesh.getObjectByName('__whoosh_pl');
@@ -1167,14 +1183,14 @@ function App() {
 						try { mesh.scale.set(scale, scale, scale); } catch (_) {}
 						try { if (uniforms) uniforms.uProgress.value = Math.max(0, 1 - eased); } catch (_) {}
 						// fade bubble out as we remove the whoosh
-						try { if (uniforms && uniforms.uBubbleAmount) uniforms.uBubbleAmount.value = Math.max(0, (uniforms.uBubbleAmount.value || 0) * (1 - eased)); } catch(_) {}
+						// bubble disabled — no value to fade
 						try { if (light && light.isLight) light.intensity = Math.max(0, startLightIntensity * (1 - eased)); } catch (_) {}
 						if (t < 1) requestAnimationFrame(animateFade);
 						else {
 							try { if (uniforms) uniforms.uProgress.value = 0; } catch (_) {}
 							try { mesh.visible = false; } catch (_) {}
 							try { if (light && light.isLight) light.intensity = 0; } catch (_) {}
-							try { if (uniforms && uniforms.uBubbleAmount) uniforms.uBubbleAmount.value = 0; } catch(_) {}
+							// bubble disabled — nothing to reset
 						}
 					};
 					requestAnimationFrame(animateFade);
@@ -1943,14 +1959,13 @@ function App() {
 								try {
 									if (initialQueueLength === 7 && typeof showPersistentWhoosh === 'function') {
 										console.log('processQueueSequence: playing final persistent whoosh after full sequence');
-										try {
-											const whooshScale = (rotationConfigRef.current && rotationConfigRef.current.whooshFinalScale) || 3.5;
-											const whooshFadeBefore = (rotationConfigRef.current && rotationConfigRef.current.whooshFadeBeforeMs) || 600;
-											showPersistentWhoosh(whooshScale, 400);
-											// schedule removal slightly before the lights are restored
-											const removeDelay = Math.max(0, lockHoldMs - whooshFadeBefore);
-											setTimeout(() => { try { if (typeof removePersistentWhoosh === 'function') removePersistentWhoosh(300); } catch (_) {} }, removeDelay);
-										} catch (_) {}
+										const whooshScale = (rotationConfigRef.current && rotationConfigRef.current.whooshFinalScale) || 3.5;
+										const whooshFadeBefore = (rotationConfigRef.current && rotationConfigRef.current.whooshFadeBeforeMs) || 600;
+												// Keep the existing persistent whoosh behavior (primary whoosh only)
+										try { showPersistentWhoosh(whooshScale, 400); } catch(_) {}
+										// schedule removal slightly before the lights are restored
+										const removeDelay = Math.max(0, lockHoldMs - whooshFadeBefore);
+										setTimeout(() => { try { if (typeof removePersistentWhoosh === 'function') removePersistentWhoosh(300); } catch (_) {} }, removeDelay);
 									}
 								} catch (_) {}
 
